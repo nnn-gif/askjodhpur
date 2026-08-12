@@ -217,6 +217,73 @@ async function fetchOSM(onStatus) {
   throw new Error('All Overpass mirrors failed. The free OSM API may be busy — please refresh in a moment.');
 }
 
+// Fetch named gates + major landmarks for the "destinations" panel — the list
+// of places the user can click to teleport to. We query OSM for the things that
+// make useful navigation targets in a historic city like Jodhpur: city gates
+// (the old-city "pol" gates), the fort, palaces, named attractions, and major
+// temples. Results are filtered to those with a name and converted to scene
+// XY so teleport can move `playerPos` directly.
+//
+// This is a SEPARATE, much smaller query than the building/road one, run after
+// the world has loaded, so it can't slow down or block the initial scene.
+async function fetchLandmarks() {
+  const q = `
+    [out:json][timeout:60];
+    (
+      nwr["historic"="city_gate"](${BBOX.south},${BBOX.west},${BBOX.north},${BBOX.east});
+      nwr["barrier"="gate"]["name"](${BBOX.south},${BBOX.west},${BBOX.north},${BBOX.east});
+      nwr["historic"="castle"](${BBOX.south},${BBOX.west},${BBOX.north},${BBOX.east});
+      nwr["tourism"="attraction"]["name"](${BBOX.south},${BBOX.west},${BBOX.north},${BBOX.east});
+      nwr["historic"="memorial"]["name"](${BBOX.south},${BBOX.west},${BBOX.north},${BBOX.east});
+    );
+    out center tags;
+  `;
+  for (const mirror of OVERPASS_MIRRORS) {
+    try {
+      const res = await fetch(mirror, {
+        method: 'POST',
+        body: 'data=' + encodeURIComponent(q),
+      });
+      if (!res.ok) continue;
+      const text = await res.text();
+      if (text.startsWith('<')) continue;
+      const json = JSON.parse(text);
+      const out = [];
+      const seen = new Set();
+      for (const el of json.elements) {
+        const tags = el.tags || {};
+        const name = tags['name:en'] || tags.name || '';
+        if (!name) continue;
+        // Get a single lat/lon: node has its own, way/relation has center.
+        let lat, lon;
+        if (el.lat != null) { lat = el.lat; lon = el.lon; }
+        else if (el.center) { lat = el.center.lat; lon = el.center.lon; }
+        else continue;
+        const [x, z] = lonLatToXY(lon, lat);
+        // Dedupe by name (some landmarks appear as both node and way).
+        const key = name.toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push({
+          name,
+          kind: tags.historic || tags.tourism || tags.barrier || 'landmark',
+          x, z, lat, lon,
+        });
+      }
+      // Sort: gates first (most useful for navigation), then by distance from
+      // origin so the closest/most-central landmarks come first.
+      const isGate = l => /^(gate|city_gate)$/i.test(l.kind);
+      out.sort((a, b) => {
+        const ga = isGate(a) ? 0 : 1, gb = isGate(b) ? 0 : 1;
+        if (ga !== gb) return ga - gb;
+        return Math.hypot(a.x, a.z) - Math.hypot(b.x, b.z);
+      });
+      return out;
+    } catch (e) { /* try next mirror */ }
+  }
+  return [];   // non-fatal: panel just won't populate
+}
+
 // -----------------------------------------------------------------------------
 // 3. Three.js scene setup
 // -----------------------------------------------------------------------------
@@ -802,6 +869,80 @@ function animateAvatar(dt, moving, speed) {
 }
 
 // -----------------------------------------------------------------------------
+// 5d. Destinations panel (teleport to gates + landmarks)
+// -----------------------------------------------------------------------------
+//
+// A collapsible list of Jodhpur's historic gates and major landmarks, fetched
+// from OpenStreetMap. Click a name and the player teleports there instantly —
+// useful for getting oriented in a dense city where walking between landmarks
+// takes a while. See README "Destinations / teleport".
+
+// Teleport the player to scene (x, z). We try a few nearby offsets if the exact
+// point is inside a building (landmarks often sit on/near footprints), so you
+// don't get stuck in a wall on arrival. Keeps the current facing direction.
+function teleportTo(x, z) {
+  // Candidate offsets in increasing radius. Try the exact point first, then a
+  // small spiral of nearby spots until one isn't blocked by collision.
+  const candidates = [
+    [0, 0], [2, 0], [-2, 0], [0, 2], [0, -2],
+    [3, 3], [-3, 3], [3, -3], [-3, -3],
+    [5, 0], [-5, 0], [0, 5], [0, -5],
+  ];
+  for (const [ox, oz] of candidates) {
+    const test = new THREE.Vector3(x + ox, 0, z + oz);
+    if (!resolveCollision(test)) {
+      playerPos.set(test.x, EYE_HEIGHT, test.z);
+      // Drop any in-flight movement so we don't smear the teleport.
+      bobPhase = 0;
+      // Refresh the place-name lookup immediately for the new location.
+      const ll = scenePosToLatLon(playerPos);
+      lastPlacePos = { x: playerPos.x, z: playerPos.z };
+      refreshPlace(ll.lat, ll.lon);
+      return true;
+    }
+  }
+  return false;   // every candidate blocked; give up silently
+}
+
+// Build the destinations panel from a list of landmarks. Each item is a button
+// that teleports the player and (if in third-person) keeps the avatar in sync.
+function populateDestinations(landmarks) {
+  const wrap = document.getElementById('destinations');
+  const list = document.getElementById('destList');
+  const count = document.getElementById('destCount');
+  if (!wrap || !list) return;
+  if (!landmarks.length) { wrap.hidden = true; return; }
+
+  list.innerHTML = '';
+  for (const lm of landmarks) {
+    const btn = document.createElement('button');
+    btn.className = 'dest-item';
+    btn.type = 'button';
+    // Friendly kind label.
+    const kindLabel = {
+      city_gate: 'Gate', gate: 'Gate', castle: 'Fort / Palace',
+      attraction: 'Attraction', memorial: 'Memorial',
+    }[lm.kind] || 'Landmark';
+    btn.innerHTML = `${lm.name}<span class="kind">${kindLabel}</span>`;
+    btn.addEventListener('click', () => {
+      const ok = teleportTo(lm.x, lm.z);
+      status.textContent = ok
+        ? `Teleported to ${lm.name}`
+        : `Couldn't land at ${lm.name} (blocked) — try another spot`;
+      // Keep the place-name cache fresh.
+      currentPlace = lm.name;
+    });
+    list.appendChild(btn);
+  }
+  count.textContent = `(${landmarks.length})`;
+  wrap.hidden = false;
+
+  // Collapsible header.
+  const header = document.getElementById('destHeader');
+  header.addEventListener('click', () => wrap.classList.toggle('collapsed'));
+}
+
+// -----------------------------------------------------------------------------
 // 6. First-person controls (PointerLockControls)
 // -----------------------------------------------------------------------------
 //
@@ -1284,6 +1425,16 @@ async function boot() {
     // empty for the first few seconds before the movement-triggered lookup
     // would have fired. The spawn point is the ORIGIN in lat/lon.
     refreshPlace(ORIGIN.lat, ORIGIN.lon);
+
+    // Fetch gates + landmarks for the destinations panel. Run AFTER the scene
+    // is live so it can't delay the initial render; it's a small, separate
+    // query and any failure is non-fatal (the panel just stays hidden).
+    fetchLandmarks().then(landmarks => {
+      populateDestinations(landmarks);
+      if (landmarks.length) {
+        console.log(`Loaded ${landmarks.length} destinations.`);
+      }
+    }).catch(err => console.warn('Landmarks fetch failed:', err.message));
 
     // Engagement strategy: start in fallback (drag-to-look) mode IMMEDIATELY.
     // The scene is visible and walkable the instant data finishes loading — no

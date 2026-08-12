@@ -95,6 +95,40 @@
       text-shadow: 0 1px 2px rgba(0,0,0,.7); transition: background .05s;
     }
     #inputDebug span.on { background: #ff3b30; }
+
+    /* Destinations panel (gates + landmarks teleport list). */
+    #destinations {
+      position: fixed; left: 12px; top: 96px; z-index: 6; width: 220px;
+      max-height: 60vh; display: flex; flex-direction: column;
+      background: rgba(0,0,0,.45); border: 1px solid rgba(255,255,255,.18);
+      border-radius: 8px; overflow: hidden; backdrop-filter: blur(2px);
+    }
+    #destHeader {
+      display: flex; align-items: center; gap: 8px; width: 100%;
+      padding: 8px 10px; background: transparent; border: 0; cursor: pointer;
+      color: #fff; font-size: 13px; font-weight: 600; text-align: left;
+      text-shadow: 0 1px 2px rgba(0,0,0,.7);
+    }
+    #destHeader span:first-child { flex: 1; }
+    #destCount { font-weight: 400; opacity: .7; font-size: 11px; }
+    #destChevron { transition: transform .15s; }
+    #destinations.collapsed #destChevron { transform: rotate(-90deg); }
+    #destinations.collapsed #destList { display: none; }
+    #destList {
+      overflow-y: auto; flex: 1; padding: 2px 4px 6px;
+      scrollbar-width: thin; scrollbar-color: rgba(255,255,255,.3) transparent;
+    }
+    #destList::-webkit-scrollbar { width: 6px; }
+    #destList::-webkit-scrollbar-thumb { background: rgba(255,255,255,.3); border-radius: 3px; }
+    .dest-item {
+      display: block; width: 100%; padding: 6px 8px; margin: 2px 0;
+      background: transparent; border: 0; border-radius: 5px; cursor: pointer;
+      color: #fff; font-size: 12.5px; text-align: left; line-height: 1.3;
+      text-shadow: 0 1px 2px rgba(0,0,0,.7);
+    }
+    .dest-item:hover { background: rgba(255,255,255,.14); }
+    .dest-item .kind { display: block; font-size: 10px; opacity: .55;
+      text-transform: uppercase; letter-spacing: .03em; margin-top: 1px; }
   </style>
 </head>
 <body>
@@ -134,6 +168,18 @@
 
   <button id="viewToggle" type="button" hidden>👁 First person (V)</button>
 
+  <!-- Destinations panel: clickable list of gates + landmarks. Click a name to
+       teleport there. Populated from OpenStreetMap at load time. Collapsible so
+       it doesn't dominate the view. See README "Destinations / teleport". -->
+  <div id="destinations" hidden>
+    <button id="destHeader" type="button">
+      <span>🚩 Gates &amp; landmarks</span>
+      <span id="destCount"></span>
+      <span id="destChevron">▾</span>
+    </button>
+    <div id="destList"></div>
+  </div>
+
   <div id="minimapWrap" hidden>
     <canvas id="minimap" width="200" height="200"></canvas>
     <div id="minimapLabel">▲ you · map is north-up</div>
@@ -156,6 +202,6 @@
   <!-- `?v=…` defeats caching of the module across releases. Bump this when
        app.js changes and you want every user (and embedded webview) to pick
        up the new code without a manual hard-reload. -->
-  <script type="module" src="./app.js?v=2026-08-12-15"></script>
+  <script type="module" src="./app.js?v=2026-08-12-16"></script>
 </body>
 </html>

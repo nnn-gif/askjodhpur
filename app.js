@@ -384,6 +384,10 @@ function buildBuildings(buildings) {
 // Line instead of a mesh to keep it cheap — there can be thousands of road
 // segments. Lines have no collision; the player can cross them freely, which
 // is what you want (roads are walkable).
+//
+// We also keep a flat list of road segments in scene coords (`roadSegments`)
+// for the minimap to draw.
+const roadSegments = [];
 function buildRoads(roads) {
   const positions = [];
   for (const r of roads) {
@@ -394,12 +398,180 @@ function buildRoads(roads) {
       const [x2, z2] = lonLatToXY(g[i+1].lon, g[i+1].lat);
       positions.push(x1, 0.05, z1, x2, 0.05, z2);   // y=0.05 to avoid z-fight
                                                      // with the ground plane
+      roadSegments.push([x1, z1, x2, z2]);
     }
   }
   const geo = new THREE.BufferGeometry();
   geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
   const mat = new THREE.LineBasicMaterial({ color: 0x333333 });
   scene.add(new THREE.LineSegments(geo, mat));
+}
+
+// -----------------------------------------------------------------------------
+// 5b. Minimap (top-down map)
+// -----------------------------------------------------------------------------
+//
+// A small canvas in the corner showing the city from above so the player can
+// see where they are and which way they're facing — the first-person view
+// alone gives no sense of overall position or heading.
+//
+// Design:
+//   - The STATIC map (buildings + roads for the whole loaded area) is rendered
+//     ONCE to an offscreen canvas when the city finishes loading. Redrawing
+//     8,900 building polygons every frame would waste CPU; rendering once and
+//     blitting is far cheaper.
+//   - Each FRAME, we draw the offscreen map onto the visible canvas, translated
+//     so the player stays centered, then draw the player marker (a triangle
+//     pointing where they look) on top.
+//   - "North up": the minimap's +Z (north) points up, +X (east) points right —
+//     matching the scene axes. The simplest mental model.
+//   - Zoom: the minimap shows a ~160 m radius around the player. The full 3 km
+//     city in 200 px would be ~15 m/px, too coarse to read locally; a player-
+//     centred zoomed view is far more useful for "where am I right now".
+
+const MINIMAP = {
+  el: null,          // visible <canvas>
+  ctx: null,         // its 2D context
+  base: null,        // offscreen canvas with the static city map
+  baseCtx: null,
+  size: 200,         // pixel size (square)
+  viewMeters: 160,   // world meters across the visible window at the player
+};
+
+function initMinimap() {
+  MINIMAP.el = document.getElementById('minimap');
+  MINIMAP.ctx = MINIMAP.el.getContext('2d');
+  // Offscreen canvas holds the full-city static layer. Sized so that the whole
+  // loaded bbox (~3 km) fits; we only blit the window around the player.
+  MINIMAP.base = document.createElement('canvas');
+  MINIMAP.baseCtx = MINIMAP.base.getContext('2d');
+}
+
+// Render the whole city once to the offscreen canvas. Called once after load.
+// We compute the data's bounding box, scale it to fit the offscreen canvas at
+// a chosen resolution, and draw every building polygon + road segment.
+function renderMinimapBase() {
+  // World bounds covered by the data. Buildings are stored in colliders[]
+  // (with poly in scene XZ); roads in roadSegments[].
+  let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
+  for (const c of colliders) {
+    for (const [x, z] of c.poly) {
+      if (x < minX) minX = x; if (x > maxX) maxX = x;
+      if (z < minZ) minZ = z; if (z > maxZ) maxZ = z;
+    }
+  }
+  for (const seg of roadSegments) {
+    const x1 = seg[0], z1 = seg[1], x2 = seg[2], z2 = seg[3];
+    if (x1 < minX) minX = x1; if (x1 > maxX) maxX = x1;
+    if (x2 < minX) minX = x2; if (x2 > maxX) maxX = x2;
+    if (z1 < minZ) minZ = z1; if (z1 > maxZ) maxZ = z1;
+    if (z2 < minZ) minZ = z2; if (z2 > maxZ) maxZ = z2;
+  }
+  // Pad bounds slightly.
+  const pad = 20;
+  minX -= pad; maxX += pad; minZ -= pad; maxZ += pad;
+  const worldW = maxX - minX, worldH = maxZ - minZ;
+
+  // Offscreen resolution: aim for ~2 px per meter so buildings are legible when
+  // we zoom in. Cap the canvas dimensions to avoid blowing past browser limits
+  // for very large bboxes (3 km × 2 px/m = 6000 px, fine).
+  const PX_PER_M = 2;
+  const bw = Math.min(8000, Math.round(worldW * PX_PER_M));
+  const bh = Math.min(8000, Math.round(worldH * PX_PER_M));
+  MINIMAP.base.width = bw;
+  MINIMAP.base.height = bh;
+  const bctx = MINIMAP.baseCtx;
+
+  // Ground fill (matches the 3D ground color).
+  bctx.fillStyle = '#c9b08a';
+  bctx.fillRect(0, 0, bw, bh);
+
+  // Helper: world (x,z) → offscreen pixel (px,py). Note z maps to y, and we
+  // flip z so that north (+z) is UP on the map (canvas y grows downward).
+  const wx = x => (x - minX) * PX_PER_M;
+  const wz = z => (maxZ - z) * PX_PER_M;   // flip: +z (north) → top of image
+
+  // Roads first (so buildings draw on top of them, like the 3D view).
+  bctx.strokeStyle = '#5a5147';
+  bctx.lineWidth = Math.max(1, PX_PER_M * 1.2);
+  bctx.beginPath();
+  for (const seg of roadSegments) {
+    bctx.moveTo(wx(seg[0]), wz(seg[1]));
+    bctx.lineTo(wx(seg[2]), wz(seg[3]));
+  }
+  bctx.stroke();
+
+  // Buildings. Use a slightly darker blue than the 3D palette so they read
+  // against the sandy ground at small size.
+  bctx.fillStyle = '#2b4a7a';
+  for (const c of colliders) {
+    const poly = c.poly;
+    if (!poly || poly.length < 3) continue;
+    bctx.beginPath();
+    bctx.moveTo(wx(poly[0][0]), wz(poly[0][1]));
+    for (let i = 1; i < poly.length; i++) bctx.lineTo(wx(poly[i][0]), wz(poly[i][1]));
+    bctx.closePath();
+    bctx.fill();
+  }
+
+  // Stash the world→pixel transform params for the per-frame draw.
+  MINIMAP.transform = { minX, maxZ, PX_PER_M };
+}
+
+// Per-frame minimap draw: blit the static map centred on the player, then draw
+// the player marker. px,py = player's pixel location in the offscreen image.
+function drawMinimap(playerX, playerZ, heading) {
+  const { minX, maxZ, PX_PER_M } = MINIMAP.transform;
+  const playerPX = (playerX - minX) * PX_PER_M;
+  const playerPY = (maxZ - playerZ) * PX_PER_M;
+
+  // Source rectangle in the offscreen image: a window around the player, sized
+  // so that `viewMeters` of world spans the visible canvas.
+  const halfWorld = MINIMAP.viewMeters / 2;
+  const halfSrcPx = halfWorld * PX_PER_M;
+  let sx = playerPX - halfSrcPx;
+  let sy = playerPY - halfSrcPx;
+  let sw = halfSrcPx * 2;
+  let sh = halfSrcPx * 2;
+  // Clamp the source rect into the offscreen bounds; if the player is near the
+  // edge of the data we don't want to read outside the image.
+  const bw = MINIMAP.base.width, bh = MINIMAP.base.height;
+  if (sx < 0) sx = 0;
+  if (sy < 0) sy = 0;
+  if (sx + sw > bw) sw = bw - sx;
+  if (sy + sh > bh) sh = bh - sy;
+
+  // Visible canvas: clear, then draw the source window scaled to fill it.
+  const ctx = MINIMAP.ctx;
+  const S = MINIMAP.size;
+  ctx.fillStyle = '#c9b08a';
+  ctx.fillRect(0, 0, S, S);
+  ctx.drawImage(MINIMAP.base, sx, sy, sw, sh, 0, 0, S, S);
+
+  // Player marker: a triangle pointing in the facing direction. `heading` is
+  // the camera yaw in radians (0 = looking toward -Z = north). On the minimap,
+  // north is up, so we convert yaw to a 2D heading: north (looking -Z) → up.
+  //   Forward direction in world XZ for yaw y: (sin y, -cos y) on (X, Z).
+  //   On the minimap image, +X is right and +Z(north) is up → forward pixel
+  //   vector is (sin y, -(-cos y)) = (sin y, cos y)... simplify below.
+  const cx = S / 2, cy = S / 2;
+  // Convert world forward to image forward. World forward (X,Z) = (sin y, -cos y).
+  // Image: X→right, Z→up means image-y = -Z. So image forward = (sin y, cos y).
+  const fx = Math.sin(heading);
+  const fy = Math.cos(heading);
+  // Perpendicular for the triangle base.
+  const px2 = -fy, py2 = fx;
+  const R = 8;       // marker size
+  ctx.fillStyle = '#ff3b30';
+  ctx.beginPath();
+  ctx.moveTo(cx + fx * R, cy + fy * R);                  // tip (forward)
+  ctx.lineTo(cx - px2 * R * 0.6, cy + py2 * R * 0.6);    // base left
+  ctx.lineTo(cx + px2 * R * 0.6, cy - py2 * R * 0.6);    // base right
+  ctx.closePath();
+  ctx.fill();
+  ctx.strokeStyle = '#fff';
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
 }
 
 // -----------------------------------------------------------------------------
@@ -744,6 +916,16 @@ function animate() {
       // If anything in the HUD update throws, never let it kill the frame loop.
       hud.textContent = 'XY: ' + pos.x.toFixed(0) + ', ' + pos.z.toFixed(0) + ' m';
     }
+
+    // --- minimap: draw the player-centred top-down view ---
+    // Derive heading from the camera's world direction so it works in both
+    // pointer-lock and fallback modes. Forward in world XZ = (sin yaw, -cos yaw).
+    try {
+      const fwd = new THREE.Vector3();
+      camera.getWorldDirection(fwd);
+      const heading = Math.atan2(fwd.x, -fwd.z);  // yaw where 0 = north (-Z)
+      drawMinimap(pos.x, pos.z, heading);
+    } catch (mmErr) { /* never let minimap kill the frame loop */ }
   }
 
   renderer.render(scene, camera);
@@ -761,6 +943,10 @@ async function boot() {
     const nB = buildBuildings(buildings);
     buildRoads(roads);
     document.getElementById('crosshair').style.display = 'block';
+    // Build the minimap now that colliders + roadSegments are populated.
+    initMinimap();
+    renderMinimapBase();
+    document.getElementById('minimapWrap').hidden = false;
     status.textContent = `Jodhpur loaded: ${nB} buildings, ${roads.length} roads`;
     console.log(`Loaded Jodhpur: ${nB} buildings, ${roads.length} roads.`);
     animate();

@@ -191,6 +191,19 @@ A few small things that matter:
 
 ---
 
+## Minimap — knowing where you are
+
+The first-person view alone gives no sense of overall position or heading, so a small **top-down minimap** sits in the top-right corner. It shows buildings (blue polygons), roads (dark lines), and a red triangle that marks the player and points where they're looking.
+
+Two things make it cheap and readable:
+
+- **Static map rendered once.** Drawing ~8,900 building polygons every frame would waste CPU. Instead, the whole loaded city is rendered **once** to an offscreen canvas when data finishes loading (`renderMinimapBase`). Each frame only blits a window of that offscreen image and draws the player marker.
+- **Player-centred, north-up.** The minimap always centres on the player and shows a ~160 m window around them — the full 3 km city in 200 px would be ~15 m/px, too coarse to read. North is up so the map's orientation never surprises you.
+
+World→minimap geometry: scene `+X` (east) → right, scene `+Z` (north) → up (the Z axis is flipped because canvas Y grows downward). The player's heading comes from the camera's world direction via `atan2(fwd.x, -fwd.z)`, which works in both pointer-lock and drag-to-look modes. The per-frame minimap draw is wrapped in a try/catch so a drawing failure can never stall the movement loop.
+
+---
+
 ## Why this works as "a walkable Vice-City-style map"
 
 The original *Vice City* is, under the hood, four things:

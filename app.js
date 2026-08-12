@@ -46,8 +46,8 @@ const METERS_PER_DEG_LAT = 111320;
 
 // Player physics constants, in meters / seconds.
 const EYE_HEIGHT     = 1.7;   // average human eye height
-const WALK_SPEED     = 1.5;   // ~5.4 km/h, a normal walking pace
-const RUN_SPEED      = 5.0;   // a jog
+const WALK_SPEED     = 4.5;   // brisk pace (~16 km/h) — zippy enough to enjoy the city
+const RUN_SPEED      = 14.0;  // sprint (hold Shift) — covers the 3 km map quickly
 const PLAYER_RADIUS  = 0.4;   // collision sphere radius
 const GRAVITY        = 20.0;  // m/s^2, used only if we add steps/jumps later
 

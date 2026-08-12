@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <!--
+    Cache-busting. ES modules and the page itself get cached aggressively by
+    embedded webviews, which stranded users on stale code during development
+    ("it never loads, just says 'Jodhpur loaded' in logs"). These metas tell
+    the browser not to cache the HTML/JS at all. For a production deployment
+    you'd switch to hashed filenames + long cache lifetimes instead.
+  -->
+  <meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate" />
+  <meta http-equiv="Pragma" content="no-cache" />
+  <title>Walk Jodhpur — 3D city walk in the browser</title>
+  <style>
+    /* See README "Styling & overlay" for why these rules exist. */
+    html, body { margin: 0; height: 100%; background: #87ceeb; overflow: hidden; font-family: system-ui, sans-serif; }
+    #app { position: fixed; inset: 0; }
+    canvas { display: block; }
+
+    /* CRITICAL: an explicit `display` value (we use flex on #overlay/#loading)
+       overrides the HTML `hidden` attribute, so toggling .hidden=true in JS
+       did nothing and the overlay stayed on screen forever ("it never loads,
+       I just see the Walk Jodhpur panel"). This rule makes [hidden] win. */
+    [hidden] { display: none !important; }
+
+    /* Crosshair dot so the player has a focal point while walking. */
+    #crosshair {
+      position: fixed; left: 50%; top: 50%; width: 6px; height: 6px;
+      margin: -3px 0 0 -3px; border-radius: 50%; background: rgba(255,255,255,.8);
+      pointer-events: none; z-index: 5;
+    }
+
+    /* "Click to walk" overlay. Pointer Lock requires a user gesture, so we
+       must NOT start until the user clicks. See README "Why a click overlay". */
+    #overlay {
+      position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+      background: rgba(0,0,0,.55); color: #fff; text-align: center; z-index: 10; cursor: pointer;
+    }
+    #overlay .panel { max-width: 460px; padding: 2rem; }
+    #overlay h1 { margin: 0 0 .5rem; font-size: 1.6rem; }
+    #overlay p  { margin: .35rem 0; opacity: .9; }
+    #overlay .keys { margin-top: 1rem; font-size: .9rem; opacity: .8; }
+    kbd { background: #222; border: 1px solid #555; border-radius: 4px; padding: 1px 6px; font-size: .85rem; }
+
+    #hud {
+      position: fixed; left: 12px; bottom: 12px; z-index: 5; color: #fff;
+      font-size: 12px; line-height: 1.5; text-shadow: 0 1px 2px rgba(0,0,0,.8);
+      background: rgba(0,0,0,.25); padding: 6px 10px; border-radius: 6px; pointer-events: none;
+    }
+    #loading { position: fixed; inset: 0; display:flex; align-items:center; justify-content:center;
+      background:#87ceeb; color:#333; font-size: 1.1rem; z-index: 8; }
+    #loading.error { background:#fee; color:#900; }
+    /* Visible load status so success/failure is observable without devtools. */
+    #status { position: fixed; right: 12px; bottom: 12px; z-index: 5; color:#fff; font-size:12px;
+      text-shadow:0 1px 2px rgba(0,0,0,.8); background: rgba(0,0,0,.25); padding:6px 10px;
+      border-radius:6px; pointer-events:none; max-width: 50vw; }
+  </style>
+</head>
+<body>
+  <div id="app"></div>
+  <div id="crosshair"></div>
+
+  <div id="loading">Loading Jodhpur from OpenStreetMap…</div>
+
+  <div id="overlay" hidden>
+    <div class="panel">
+      <h1>🚶 Walk Jodhpur</h1>
+      <p>A walkable 3D map of Jodhpur, Rajasthan, built from live OpenStreetMap data.</p>
+      <p style="opacity:.7;font-size:.85rem">Loading the city — it'll start automatically when ready.</p>
+      <div class="keys">
+        <kbd>W</kbd> <kbd>A</kbd> <kbd>S</kbd> <kbd>D</kbd> — move &nbsp;•&nbsp;
+        Mouse / drag — look &nbsp;•&nbsp;
+        <kbd>←</kbd><kbd>→</kbd> or <kbd>Q</kbd><kbd>E</kbd> — turn &nbsp;•&nbsp;
+        <kbd>Shift</kbd> — run
+      </div>
+      <p style="margin-top:1rem;font-weight:600">Click to start (or just wait a moment)</p>
+    </div>
+  </div>
+
+  <div id="hud" hidden></div>
+  <div id="status">Loading…</div>
+
+  <!--
+    Import map: lets us write bare specifiers like `import * as THREE from 'three'`
+    in a browser without a bundler. We pin a specific version so the demo never
+    silently breaks when three.js ships a breaking change. See README "No build step".
+  -->
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+    }
+  }
+  </script>
+
+  <!-- `?v=…` defeats caching of the module across releases. Bump this when
+       app.js changes and you want every user (and embedded webview) to pick
+       up the new code without a manual hard-reload. -->
+  <script type="module" src="./app.js?v=2026-08-12-9"></script>
+</body>
+</html>

@@ -756,6 +756,27 @@ addEventListener('keydown', e => {
 });
 addEventListener('keyup',   e => { keys[e.code] = false; });
 
+// Live WASD input indicator (#inputDebug). Reflects the `keys` state each frame
+// so you can see whether key events are reaching the page. If a key never
+// lights up while you press it, that key isn't being delivered (focus issue,
+// webview input blocking, or stale cached code).
+const inputSpans = {};
+function setupInputDebug() {
+  const wrap = document.getElementById('inputDebug');
+  if (!wrap) return;
+  for (const el of wrap.querySelectorAll('span[data-k]')) {
+    inputSpans[el.getAttribute('data-k')] = el;
+  }
+  wrap.hidden = false;
+}
+function updateInputDebug() {
+  for (const code in inputSpans) {
+    const el = inputSpans[code];
+    if (keys[code]) el.classList.add('on');
+    else el.classList.remove('on');
+  }
+}
+
 // Start the player on a real street. The naive origin (0,0,0) lands inside a
 // building's footprint in dense central Jodhpur and traps the player. This
 // point was verified to sit on the "Layakam Mohalla" lane with ~2 m of
@@ -803,6 +824,7 @@ controls.addEventListener('lock', () => {
     viewBtn.hidden = false;
     viewBtn.addEventListener('click', toggleView);
   }
+  setupInputDebug();
   status.textContent += '  •  mouse-look (pointer lock)';
 });
 controls.addEventListener('unlock', () => {
@@ -825,6 +847,7 @@ function startFallback() {
     viewBtn.hidden = false;
     viewBtn.addEventListener('click', toggleView);
   }
+  setupInputDebug();
   status.textContent += '  •  drag to look, arrows to turn (pointer lock unavailable in this browser)';
 
   // Drag with the mouse / touch to look around. Track button state so we only
@@ -1023,6 +1046,9 @@ function animate() {
         applyFallbackLook();
       }
     }
+
+    // Mirror current key state to the on-screen WASD indicator.
+    updateInputDebug();
 
     // --- desired horizontal velocity from input ---
     const speed = keys['ShiftLeft'] || keys['ShiftRight'] ? RUN_SPEED : WALK_SPEED;

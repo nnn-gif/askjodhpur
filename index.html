@@ -81,6 +81,20 @@
       text-shadow:0 1px 2px rgba(0,0,0,.7);
     }
     #viewToggle:hover { background: rgba(0,0,0,.6); }
+
+    /* Live WASD input indicator. Dim by default, bright when the matching key
+       is held. See README "Debugging input". */
+    #inputDebug {
+      position: fixed; left: 12px; top: 56px; z-index: 6;
+      display: flex; gap: 4px; pointer-events: none;
+      font-family: ui-monospace, monospace; font-size: 13px; font-weight: 700;
+    }
+    #inputDebug span {
+      width: 20px; height: 20px; line-height: 20px; text-align: center;
+      border-radius: 4px; color: #fff; background: rgba(0,0,0,.3);
+      text-shadow: 0 1px 2px rgba(0,0,0,.7); transition: background .05s;
+    }
+    #inputDebug span.on { background: #ff3b30; }
   </style>
 </head>
 <body>
@@ -108,6 +122,16 @@
   <div id="hud" hidden></div>
   <div id="status">Loading…</div>
 
+  <!-- Live input indicator: lights up W/A/S/D as they're held, so you can see
+       whether key events reach the page (useful when "forward isn't working"
+       — if W never highlights, the key isn't being received). -->
+  <div id="inputDebug" hidden>
+    <span data-k="KeyW">W</span>
+    <span data-k="KeyA">A</span>
+    <span data-k="KeyS">S</span>
+    <span data-k="KeyD">D</span>
+  </div>
+
   <button id="viewToggle" type="button" hidden>👁 First person (V)</button>
 
   <div id="minimapWrap" hidden>
@@ -132,6 +156,6 @@
   <!-- `?v=…` defeats caching of the module across releases. Bump this when
        app.js changes and you want every user (and embedded webview) to pick
        up the new code without a manual hard-reload. -->
-  <script type="module" src="./app.js?v=2026-08-12-12"></script>
+  <script type="module" src="./app.js?v=2026-08-12-13"></script>
 </body>
 </html>

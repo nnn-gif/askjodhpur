@@ -387,31 +387,124 @@ function buildBuildings(buildings) {
   return built;
 }
 
-// Roads: draw each highway as a thin flat ribbon on the ground. We use a
-// Line instead of a mesh to keep it cheap — there can be thousands of road
-// segments. Lines have no collision; the player can cross them freely, which
-// is what you want (roads are walkable).
+// Roads: draw each highway as a FLAT RIBBON (a quad) lying on the ground, with
+// width based on road type. Earlier these were 1-pixel lines, which vanished
+// against the sandy ground at any distance — making the street network, the
+// thing you actually navigate by, unreadable. Ribbons make roads a real,
+// visible part of the world.
+//
+// Width and color come from the highway=* tag:
+//   trunk/primary  → wide, light gray (main arteries)
+//   secondary/tertiary → medium, gray
+//   residential/service/living_street → narrow, darker gray
+//   footway/path/steps/pedestrian/cycleway → very narrow, tan (walkable paths)
+//
+// Geometry: for each segment p1→p2, compute the perpendicular direction, then
+// build a quad with the 4 corner points offset by ±width/2. Roads are flat at
+// y=0.06 (just above the ground to avoid z-fighting). They have no collision —
+// the player can walk on them, which is the point.
 //
 // We also keep a flat list of road segments in scene coords (`roadSegments`)
 // for the minimap to draw.
 const roadSegments = [];
+
+// Per-road-type rendering config: [width in meters, color].
+const ROAD_STYLE = {
+  trunk:        [7.0, 0x9a9a9a],
+  primary:      [6.5, 0x9a9a9a],
+  primary_link: [5.0, 0x9a9a9a],
+  secondary:    [5.5, 0x8e8e8e],
+  secondary_link:[4.5, 0x8e8e8e],
+  tertiary:     [4.5, 0x848484],
+  unclassified: [4.0, 0x7a7a7a],
+  residential:  [3.5, 0x70706e],
+  living_street:[3.5, 0x70706e],
+  service:      [3.0, 0x6a6a68],
+  pedestrian:   [3.0, 0xb89a6a],
+  footway:      [1.2, 0xb89a6a],
+  path:         [1.2, 0xb89a6a],
+  steps:        [1.2, 0xb89a6a],
+  cycleway:     [1.5, 0xb89a6a],
+};
+const DEFAULT_ROAD_STYLE = [3.0, 0x70706e];
+
+function roadWidth(tags) {
+  // If the road has an explicit width tag, honor it; otherwise use the type.
+  const w = parseFloat(tags.width);
+  if (!isNaN(w) && w > 0) return Math.min(w, 12);   // cap absurd values
+  const hw = tags.highway;
+  return (ROAD_STYLE[hw] || DEFAULT_ROAD_STYLE)[0];
+}
+function roadColor(tags) {
+  const hw = tags.highway;
+  return (ROAD_STYLE[hw] || DEFAULT_ROAD_STYLE)[1];
+}
+
 function buildRoads(roads) {
-  const positions = [];
+  // Group vertices by color so we can build one BufferGeometry per material
+  // (cheap to render; avoids one draw call per road).
+  const byColor = Object.create(null);   // colorHex -> { verts: [], idx: [], mat: null }
+  const ROAD_Y = 0.06;                   // just above ground to prevent z-fighting
+
   for (const r of roads) {
     const g = r.geometry;
     if (!g || g.length < 2) continue;
+    const tags = r.tags || {};
+    const width = roadWidth(tags);
+    const half = width / 2;
+    const color = roadColor(tags);
+    let bucket = byColor[color];
+    if (!bucket) {
+      bucket = { verts: [], idx: [], color };
+      byColor[color] = bucket;
+    }
+
     for (let i = 0; i < g.length - 1; i++) {
       const [x1, z1] = lonLatToXY(g[i].lon, g[i].lat);
       const [x2, z2] = lonLatToXY(g[i+1].lon, g[i+1].lat);
-      positions.push(x1, 0.05, z1, x2, 0.05, z2);   // y=0.05 to avoid z-fight
-                                                     // with the ground plane
       roadSegments.push([x1, z1, x2, z2]);
+
+      // Direction of this segment and its perpendicular (in XZ).
+      let dx = x2 - x1, dz = z2 - z1;
+      const len = Math.hypot(dx, dz);
+      if (len < 0.01) continue;
+      // Perpendicular in XZ: rotate (dx,dz) by 90° → (-dz, dx). Normalize, scale.
+      const px = -dz / len * half;
+      const pz =  dx / len * half;
+
+      // Four corners of the ribbon quad (flat on the ground).
+      const base = bucket.verts.length / 3;
+      bucket.verts.push(
+        x1 + px, ROAD_Y, z1 + pz,   // 0: p1 left
+        x1 - px, ROAD_Y, z1 - pz,   // 1: p1 right
+        x2 - px, ROAD_Y, z2 - pz,   // 2: p2 right
+        x2 + px, ROAD_Y, z2 + pz,   // 3: p2 left
+      );
+      // Two triangles: (0,1,2) and (0,2,3).
+      bucket.idx.push(base, base+1, base+2,  base, base+2, base+3);
     }
   }
-  const geo = new THREE.BufferGeometry();
-  geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
-  const mat = new THREE.LineBasicMaterial({ color: 0x333333 });
-  scene.add(new THREE.LineSegments(geo, mat));
+
+  // Build one mesh per color bucket.
+  for (const color in byColor) {
+    const bucket = byColor[color];
+    if (bucket.verts.length === 0) continue;
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(bucket.verts, 3));
+    geo.setIndex(bucket.idx);
+    geo.computeBoundingSphere();   // helps frustum culling
+    const mesh = new THREE.Mesh(geo, roadMaterial(parseInt(color)));
+    scene.add(mesh);
+  }
+}
+
+// Cache materials per color so roads of the same type share one material.
+const _roadMatCache = Object.create(null);
+function roadMaterial(color) {
+  if (!_roadMatCache[color]) {
+    _roadMatCache[color] = new THREE.MeshBasicMaterial({ color, roughness: 1 });
+  }
+  return _roadMatCache[color];
 }
 
 // -----------------------------------------------------------------------------

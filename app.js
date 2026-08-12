@@ -109,8 +109,13 @@ const OVERPASS_MIRRORS = [
   'https://overpass.openstreetmap.fr/api/interpreter',
 ];
 const TRANSIENT_STATUS = new Set([429, 500, 502, 503, 504]);
-const ATTEMPTS_PER_MIRROR = 2;
-const RETRY_DELAY_MS = 1500;
+// More retries + longer backoff than you'd usually need, because the public
+// Overpass service is spiky: some days a full-city query takes 2s, other days
+// (under load, or during a network blip) connections get reset with
+// ERR_NETWORK_CHANGED and need several seconds to recover before a retry can
+// succeed. Riding that out here is better than making the user refresh.
+const ATTEMPTS_PER_MIRROR = 4;
+const RETRY_DELAY_MS = 2500;
 
 function buildOverpassQuery(bbox) {
   // bbox defaults to the full city box; a smaller bbox can be passed in by the

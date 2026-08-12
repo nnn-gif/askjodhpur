@@ -43,7 +43,7 @@ python3 -m http.server 8000
 
 Or with Node: `npx serve .` — any static server works.
 
-The city loads and you can walk immediately — **W A S D** to move, **drag** to look around, **`←` `→`** or **Q/E** to turn, **Shift** to run. (In a normal desktop browser, clicking once upgrades you to pointer-lock FPS mouse-look; in embedded webviews like this one, drag-to-look just stays active.)
+The city loads and you can walk immediately — **W A S D** to move, **drag** to look around, **`←` `→`** or **Q/E** to turn, **Shift** to run, **V** to switch between first- and third-person. (In a normal desktop browser, clicking once upgrades you to pointer-lock FPS mouse-look; in embedded webviews like this one, drag-to-look just stays active.)
 
 ---
 
@@ -201,6 +201,24 @@ Two things make it cheap and readable:
 - **Player-centred, north-up.** The minimap always centres on the player and shows a ~160 m window around them — the full 3 km city in 200 px would be ~15 m/px, too coarse to read. North is up so the map's orientation never surprises you.
 
 World→minimap geometry: scene `+X` (east) → right, scene `+Z` (north) → up (the Z axis is flipped because canvas Y grows downward). The player's heading comes from the camera's world direction via `atan2(fwd.x, -fwd.z)`, which works in both pointer-lock and drag-to-look modes. The per-frame minimap draw is wrapped in a try/catch so a drawing failure can never stall the movement loop.
+
+---
+
+## Character / third-person view (Vice-City style)
+
+Press **V** (or click the **👁 button** in the top-left) to switch between first- and third-person. In third-person you see a small blocky humanoid — your character — walking through Jodhpur, with the camera trailing behind and above, exactly like the original *Vice City*.
+
+**Procedural avatar, no external assets.** The humanoid is built entirely from `BoxGeometry` primitives — torso, head/hair, two arms, two legs — in ~50 lines of `buildAvatar()`. Each limb is a child of a small *pivot group* positioned at the shoulder/hip joint, so rotating the pivot about X swings the limb naturally. This matches the demo's "no build step, no assets" philosophy: it can never 404 or hit a license snag. Colors lean Vice-City (orange "Hawaiian" shirt, dark pants).
+
+**Walk cycle.** `animateAvatar(dt, moving, speed)` swings the four limbs with a sine while moving — opposite arms/legs (left arm forward when right leg forward) — and the swing frequency scales with speed so running looks faster than walking. When idle, the limbs ease back to neutral. The avatar's yaw tracks the player's facing so the character turns to face where you look.
+
+**The architectural change underneath.** Before this feature, *the camera was the player* — `camera.position` sat at eye height and was moved directly. Third-person requires decoupling them, so the code now maintains a canonical `playerPos` (feet-level) that **both view modes share**. Each frame the movement + collision math moves `playerPos`, then the camera is placed relative to it:
+- **First-person:** camera at `playerPos + (0, EYE_HEIGHT + headBob, 0)`. Numerically identical to before — same eye height, same ±4 cm head-bob. Verified to feel unchanged.
+- **Third-person:** camera at `playerPos - forward·4.5 m + (0, 2.2 m, 0)`, looking at the avatar's chest (`AVATAR_LOOK_HEIGHT = 1.2 m`); the avatar mesh sits at `playerPos` with `y=0`.
+
+A subtle but important correctness fix came with this: the manual `yaw`/`pitch` variables are **stale in pointer-lock mode** (PointerLockControls writes the camera quaternion directly, bypassing them). So the avatar's facing and the third-person camera offset are derived from a single `getPlayerYaw()` helper that reads yaw from the camera's world direction (`atan2(fwd.x, -fwd.z)` — the same formula the minimap already used). This makes the character's facing correct in **both** pointer-lock and drag-to-look modes.
+
+**Known limitation:** the third-person camera doesn't (yet) collide with walls, so in Jodhpur's tight lanes it can clip through a building behind you. A real fix is camera ray-collision against building AABBs; noted as a future improvement rather than tackled here.
 
 ---
 

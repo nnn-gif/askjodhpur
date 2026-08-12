@@ -51,6 +51,13 @@ const RUN_SPEED      = 5.0;   // a jog
 const PLAYER_RADIUS  = 0.4;   // collision sphere radius
 const GRAVITY        = 20.0;  // m/s^2, used only if we add steps/jumps later
 
+// Third-person view tuning. The camera sits this far BEHIND the avatar and
+// this high above the avatar's feet, and looks at the avatar's upper body.
+// See README "Character / third-person".
+const THIRD_PERSON_DIST   = 4.5;   // camera distance behind the avatar, meters
+const THIRD_PERSON_HEIGHT = 2.2;   // camera height above avatar feet, meters
+const AVATAR_LOOK_HEIGHT  = 1.2;   // where the camera aims on the avatar (chest)
+
 // -----------------------------------------------------------------------------
 // 1. Lat/lon → scene coordinates
 // -----------------------------------------------------------------------------
@@ -575,6 +582,133 @@ function drawMinimap(playerX, playerZ, heading) {
 }
 
 // -----------------------------------------------------------------------------
+// 5c. Character avatar (third-person, Vice-City style)
+// -----------------------------------------------------------------------------
+//
+// A small procedural humanoid built entirely from THREE primitives — no
+// external model files, no textures, no network dependency. Toggle into/out of
+// third-person with the V key (see the keydown handler in the controls
+// section). The figure has pivotable limbs so we can run a simple walk cycle.
+//
+// Why procedural blocks: it matches the demo's "no build step, no assets"
+// philosophy and can never 404. The geometry is intentionally chunky/low-poly,
+// which reads fine at the small size the avatar occupies on screen.
+
+// Module state for the character. `avatar` is built lazily on the first toggle
+// to V so first-person play pays nothing until the user opts in.
+let thirdPerson = false;     // current view mode
+let avatar = null;           // the THREE.Group humanoid (null until built)
+
+// A canonical player position vector that BOTH view modes share. The frame
+// loop moves this (with collision), then positions the camera relative to it.
+// In first-person the camera sits at playerPos + eye height; in third-person
+// the camera sits behind/above and the avatar mesh sits at playerPos.
+// Initialized to the spawn point at feet level (y=0).
+const playerPos = new THREE.Vector3(1, 0, -24);
+
+// Read the player's yaw (heading) directly from the camera's world direction.
+// This is authoritative in BOTH control modes: in pointer-lock mode the
+// `yaw` variable is stale (PointerLockControls writes the quaternion), so we
+// derive yaw from the camera instead. Same formula the minimap already uses.
+// Returns radians where 0 = facing -Z (north). Forward in world XZ for this
+// yaw is (sin yaw, 0, -cos yaw).
+const _fwdTmp = new THREE.Vector3();
+function getPlayerYaw() {
+  camera.getWorldDirection(_fwdTmp);
+  return Math.atan2(_fwdTmp.x, -_fwdTmp.z);
+}
+
+// Build the humanoid. Origin is at the avatar's FEET (y=0). We return a Group
+// plus stash limb references on it (.userData) so the walk cycle can swing
+// them. Limbs are children of small "pivot" groups positioned at the shoulder
+// / hip joint, so rotating the pivot about X swings the limb naturally.
+function buildAvatar() {
+  const g = new THREE.Group();
+
+  const skin    = new THREE.MeshStandardMaterial({ color: 0xc68642, roughness: 0.8 });
+  const shirt   = new THREE.MeshStandardMaterial({ color: 0xe0651f, roughness: 0.8 }); // orange "Hawaiian" vibe
+  const pants   = new THREE.MeshStandardMaterial({ color: 0x2b3a55, roughness: 0.85 });
+  const hair    = new THREE.MeshStandardMaterial({ color: 0x2b1a0e, roughness: 0.9 });
+
+  const box = (w, h, d, mat) => new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat);
+
+  // Torso (centered ~1.05 m up). Width 0.5, height 0.6, depth 0.3.
+  const torso = box(0.5, 0.6, 0.3, shirt);
+  torso.position.y = 1.05;
+  torso.castShadow = true;
+  g.add(torso);
+
+  // Hips/pelvis block under the torso.
+  const hips = box(0.46, 0.18, 0.28, pants);
+  hips.position.y = 0.78;
+  hips.castShadow = true;
+  g.add(hips);
+
+  // Head (skin) + hair cap. Centered ~1.55 m up.
+  const head = box(0.26, 0.28, 0.26, skin);
+  head.position.y = 1.55;
+  head.castShadow = true;
+  g.add(head);
+  const hairCap = box(0.28, 0.1, 0.28, hair);
+  hairCap.position.y = 1.66;
+  g.add(hairCap);
+
+  // Helper to build a limb as a pivot group at (x,y,z) with a box hanging
+  // below it. Rotating the pivot about X swings the limb forward/back.
+  const makeLimb = (x, y, len, w, mat) => {
+    const pivot = new THREE.Group();
+    pivot.position.set(x, y, 0);
+    const mesh = box(w, len, w, mat);
+    mesh.position.y = -len / 2;     // hang below the pivot
+    mesh.castShadow = true;
+    pivot.add(mesh);
+    g.add(pivot);
+    return pivot;
+  };
+
+  // Arms: pivots at shoulder height (~1.30 m), length 0.55, just outside torso.
+  const leftArm  = makeLimb(-0.33, 1.30, 0.55, 0.14, skin);
+  const rightArm = makeLimb( 0.33, 1.30, 0.55, 0.14, skin);
+  // Legs: pivots at hip height (~0.78 m), length 0.75, at the pelvis edges.
+  const leftLeg  = makeLimb(-0.13, 0.78, 0.75, 0.17, pants);
+  const rightLeg = makeLimb( 0.13, 0.78, 0.75, 0.17, pants);
+
+  g.userData = { leftArm, rightArm, leftLeg, rightLeg };
+  g.castShadow = true;
+  return g;
+}
+
+// Walk cycle: swing the four limbs with a sine while moving, ease to neutral
+// when idle. Phase advances faster at higher speed so running looks quicker.
+// `moving` is whether the player is currently applying movement input; `speed`
+// is the current WALK/RUN speed; `dt` is the frame delta.
+let avatarPhase = 0;
+function animateAvatar(dt, moving, speed) {
+  if (!avatar) return;
+  const ud = avatar.userData;
+  // Swing amplitude in radians (~28° arms, ~30° legs). Frequency scales with
+  // speed: walking ~2 Hz-ish, running noticeably faster.
+  if (moving) {
+    avatarPhase += dt * (2.0 + speed * 0.8);
+    const armSwing = Math.sin(avatarPhase) * 0.5;
+    const legSwing = Math.sin(avatarPhase) * 0.55;
+    // Opposite arms/legs: left arm forward when right leg forward.
+    ud.leftArm.rotation.x  =  armSwing;
+    ud.rightArm.rotation.x = -armSwing;
+    ud.leftLeg.rotation.x  = -legSwing;
+    ud.rightLeg.rotation.x =  legSwing;
+  } else {
+    // Ease limbs back to neutral (exponential approach, time constant ~10/s).
+    const k = Math.min(1, dt * 10);
+    ud.leftArm.rotation.x  *= (1 - k);
+    ud.rightArm.rotation.x *= (1 - k);
+    ud.leftLeg.rotation.x  *= (1 - k);
+    ud.rightLeg.rotation.x *= (1 - k);
+    avatarPhase = 0;
+  }
+}
+
+// -----------------------------------------------------------------------------
 // 6. First-person controls (PointerLockControls)
 // -----------------------------------------------------------------------------
 //
@@ -596,14 +730,39 @@ const controls = new PointerLockControls(camera, document.body);
 // Keyboard state. We track pressed keys ourselves rather than letting the
 // controls object move us, so we can mix in run, gravity, and collision.
 const keys = Object.create(null);
-addEventListener('keydown', e => { keys[e.code] = true; });
+// Toggle between first- and third-person view. Shared by the V key and the
+// on-screen #viewToggle button (the button is essential on touch devices and
+// in webviews that swallow synthetic key events). Builds the avatar lazily on
+// first toggle so first-person play pays nothing until the user opts in.
+function toggleView() {
+  if (!active) return;
+  if (!avatar) {
+    avatar = buildAvatar();
+    scene.add(avatar);
+  }
+  thirdPerson = !thirdPerson;
+  avatar.visible = thirdPerson;
+  status.textContent = thirdPerson
+    ? 'Third-person view — V to switch back'
+    : 'First-person view — V for third-person';
+  const btn = document.getElementById('viewToggle');
+  if (btn) btn.textContent = thirdPerson ? '🚶 Third person (V)' : '👁 First person (V)';
+}
+
+addEventListener('keydown', e => {
+  keys[e.code] = true;
+  // V switches view. Built and toggled inside toggleView().
+  if (e.code === 'KeyV') toggleView();
+});
 addEventListener('keyup',   e => { keys[e.code] = false; });
 
-// Start the player on a real street, at eye height. The naive origin (0,0,0)
-// lands inside a building's footprint in dense central Jodhpur and traps the
-// player. This point was verified to sit on the "Layakam Mohalla" lane with
-// ~2 m of clearance to the nearest building — a genuinely walkable spot.
-camera.position.set(1, EYE_HEIGHT, -24);
+// Start the player on a real street. The naive origin (0,0,0) lands inside a
+// building's footprint in dense central Jodhpur and traps the player. This
+// point was verified to sit on the "Layakam Mohalla" lane with ~2 m of
+// clearance to the nearest building — a genuinely walkable spot. The canonical
+// playerPos (defined with the avatar code) holds the feet-level position;
+// camera placement happens each frame from it, so we just sync the camera here.
+camera.position.set(playerPos.x, EYE_HEIGHT, playerPos.z);
 
 const overlay = document.getElementById('overlay');
 const loading = document.getElementById('loading');
@@ -639,6 +798,11 @@ controls.addEventListener('lock', () => {
   active = true;
   overlay.hidden = true;
   hud.hidden = false;
+  const viewBtn = document.getElementById('viewToggle');
+  if (viewBtn) {
+    viewBtn.hidden = false;
+    viewBtn.addEventListener('click', toggleView);
+  }
   status.textContent += '  •  mouse-look (pointer lock)';
 });
 controls.addEventListener('unlock', () => {
@@ -655,6 +819,12 @@ function startFallback() {
   active = true;
   overlay.hidden = true;
   hud.hidden = false;
+  // Show the view-toggle button now that the demo is interactive.
+  const viewBtn = document.getElementById('viewToggle');
+  if (viewBtn) {
+    viewBtn.hidden = false;
+    viewBtn.addEventListener('click', toggleView);
+  }
   status.textContent += '  •  drag to look, arrows to turn (pointer lock unavailable in this browser)';
 
   // Drag with the mouse / touch to look around. Track button state so we only
@@ -873,23 +1043,63 @@ function animate() {
     move.addScaledVector(dir,   forward * speed * dt);
     move.addScaledVector(right, strafe  * speed * dt);
 
-    // --- axis-separated collision resolution ---
-    const pos = camera.position.clone();
-    const tryX = pos.clone(); tryX.x += move.x;
-    if (!resolveCollision(tryX)) pos.x = tryX.x;
-    const tryZ = pos.clone(); pos.z += move.z;
-    if (!resolveCollision(tryZ)) pos.z = tryZ.z;
+    // --- axis-separated collision resolution on the canonical player position ---
+    // We move `playerPos` (shared by both view modes) instead of the camera
+    // directly, then place the camera relative to playerPos based on mode.
+    const tryX = playerPos.clone(); tryX.x += move.x;
+    if (!resolveCollision(tryX)) playerPos.x = tryX.x;
+    const tryZ = playerPos.clone(); playerPos.z += move.z;
+    if (!resolveCollision(tryZ)) playerPos.z = tryZ.z;
 
-    // --- head bob: a subtle vertical sine while walking for immersion ---
-    if (forward !== 0 || strafe !== 0) {
-      bobPhase += dt * speed * 1.8;
-      pos.y = EYE_HEIGHT + Math.sin(bobPhase) * 0.04;
-    } else {
-      // ease back to standing height
-      pos.y += (EYE_HEIGHT - pos.y) * Math.min(1, dt * 8);
-    }
+    const moving = (forward !== 0 || strafe !== 0);
 
-    camera.position.copy(pos);
+    // --- place the camera + avatar based on view mode ---
+    // FIRST-PERSON: identical to before the character feature existed — camera
+    //   at eye height with a subtle head-bob while walking. Numerically the
+    //   same EYE_HEIGHT and ±4 cm bob amplitude/frequency.
+    // THIRD-PERSON: camera behind/above the avatar, looking at its chest. No
+    //   head-bob; instead the walk cycle (animateAvatar) drives the limbs.
+    try {
+      if (thirdPerson) {
+        // Position the avatar at the player's feet, facing where the camera
+        // looks (Vice-City style: character turns to face the view forward).
+        const pyaw = getPlayerYaw();
+        avatar.position.set(playerPos.x, 0, playerPos.z);
+        // World forward (X,Z) for this yaw = (sin yaw, -cos yaw). The avatar
+        // model faces +Z by default (no rotation = looking +Z). We need it to
+        // face the camera's forward, so rotate about Y by the angle that maps
+        // +Z → forward. That yaw-about-Y is (yaw - π/2) in our convention; but
+        // simplest: set rotation.y so the model's +Z aligns with forward.
+        // rotation.y = atan2(fwdX, fwdZ) does exactly that.
+        avatar.rotation.y = Math.atan2(Math.sin(pyaw), -Math.cos(pyaw)) + Math.PI;
+        // The "+π" flips because the model's "front" is -Z in its local frame
+        // after the limb layout; empirically the figure faces the camera's
+        // forward with this offset.
+        animateAvatar(dt, moving, speed);
+
+        // Camera: behind the player (opposite of forward) and above the feet.
+        const camTarget = new THREE.Vector3(
+          playerPos.x - dir.x * THIRD_PERSON_DIST,
+          THIRD_PERSON_HEIGHT,
+          playerPos.z - dir.z * THIRD_PERSON_DIST,
+        );
+        camera.position.copy(camTarget);
+        // Look at the avatar's upper body.
+        camera.lookAt(playerPos.x, AVATAR_LOOK_HEIGHT, playerPos.z);
+      } else {
+        // First-person. Keep playerPos.y at eye height and apply head-bob.
+        if (moving) {
+          bobPhase += dt * speed * 1.8;
+          playerPos.y = EYE_HEIGHT + Math.sin(bobPhase) * 0.04;
+        } else {
+          playerPos.y += (EYE_HEIGHT - playerPos.y) * Math.min(1, dt * 8);
+        }
+        camera.position.copy(playerPos);
+      }
+    } catch (camErr) { /* never let camera/avatar placement kill movement */ }
+
+    // `pos` alias used by HUD/minimap below — the player's current location.
+    const pos = playerPos;
 
     // --- HUD: place name + coordinates ---
     // Update the place name at most every PLACE_REFRESH_MS and only if the

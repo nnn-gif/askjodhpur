@@ -1067,12 +1067,28 @@ controls.addEventListener('lock', () => {
   status.textContent += '  •  mouse-look (pointer lock)';
 });
 controls.addEventListener('unlock', () => {
-  // If we ever had lock, releasing it (Esc) returns to the start overlay.
-  if (active && controls.pointerLockElement !== null) {
+  // Esc / losing pointer lock PAUSES the game instead of stranding the user.
+  // We show the overlay as a "paused — click to resume" screen and flip
+  // `active` off so movement/HUD freeze. Clicking the overlay (or pressing any
+  // movement key) resumes via resumeGame() so there's always a way back.
+  if (active) {
     active = false;
     overlay.hidden = false;
+    status.textContent = 'Paused — click or press a key to resume';
   }
 });
+
+// Resume from the paused state shown on Esc. Re-enables the game and re-hides
+// the overlay. Safe to call repeatedly (no-op if already active).
+function resumeGame() {
+  if (active) return;
+  active = true;
+  overlay.hidden = true;
+  hud.hidden = false;
+  status.textContent = thirdPerson
+    ? 'Third-person view — V to switch'
+    : 'Resumed — drag to look, arrows to turn';
+}
 
 // --- Fallback path (drag-to-look + arrow keys), used when no pointer lock ---
 function startFallback() {
@@ -1455,17 +1471,30 @@ async function boot() {
     startFallback();
     loading.hidden = true;
     overlay.hidden = true;   // never block the scene; keep the element for the
-                             // pointerlock 'unlock' handler if we ever upgrade.
+                             // pointerlock 'unlock' (pause) handler.
 
-    addEventListener('pointerdown', () => {
-      // Only upgrade if we're not already in pointer-lock mode.
+    // Persistent resume handler. After Esc pauses the game, clicking the
+    // overlay (or pressing a movement key) resumes it. The same handler also
+    // attempts a pointer-lock upgrade on the first interaction.
+    const onInteract = () => {
+      // If paused, resume first.
+      if (!active) resumeGame();
+      // Try to upgrade to pointer lock (no-op if unsupported / already locked).
       if (!controls.isLocked) {
         try {
           const p = controls.lock();
           if (p && typeof p.catch === 'function') p.catch(() => {});
         } catch (e) { /* stay in fallback */ }
       }
-    }, { once: true });
+    };
+    overlay.addEventListener('click', onInteract);
+    addEventListener('pointerdown', onInteract);
+    addEventListener('keydown', e => {
+      // Resume on any movement/look key, but not on modifier-only presses.
+      if (!active && ['KeyW','KeyA','KeyS','KeyD','ArrowUp','ArrowDown','ArrowLeft','ArrowRight','KeyQ','KeyE'].includes(e.code)) {
+        resumeGame();
+      }
+    });
   } catch (err) {
     loading.classList.add('error');
     loading.textContent = 'Failed to load Jodhpur map data: ' + err.message +

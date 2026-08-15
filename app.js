@@ -1443,13 +1443,17 @@ function startFallback() {
   const onUp = () => { dragState.dragging = false; };
 
   renderer.domElement.addEventListener('mousedown',  e => onDown(e.clientX, e.clientY));
-  addEventListener('mousemove', e => onMove(e.clientX, e.clientY));
+  // If the primary button is no longer held on a mousemove, the drag is over
+  // (the mouseup happened outside the window). This is the spurious-safe way
+  // to catch "stuck" drags: an earlier version also ended drags on window
+  // blur / document mouseleave, but those fire spuriously mid-gesture in
+  // embedded webviews and killed perfectly good drags ("when I drag it
+  // stops at some point").
+  addEventListener('mousemove', e => {
+    if (dragState.dragging && (e.buttons & 1) === 0) { onUp(); return; }
+    onMove(e.clientX, e.clientY);
+  });
   addEventListener('mouseup',   onUp);
-  // If the pointer leaves the page (or the window loses focus) mid-drag, the
-  // mouseup never arrives — without this the edge-continue rotation would run
-  // away with a "stuck" drag.
-  document.addEventListener('mouseleave', onUp);
-  addEventListener('blur', onUp);
   // Touch support, so the demo also works on phones/tablets.
   renderer.domElement.addEventListener('touchstart', e => {
     if (e.touches[0]) onDown(e.touches[0].clientX, e.touches[0].clientY);

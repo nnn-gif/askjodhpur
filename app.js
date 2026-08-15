@@ -1109,7 +1109,7 @@ controls.addEventListener('unlock', () => {
   if (active) {
     active = false;
     dom.overlay.hidden = false;
-    dom.status.textContent = 'Paused — click or press a key to resume';
+    dom.status.textContent = 'Paused — click a landmark to jump there, or click the card / press a key to resume';
   }
 });
 
@@ -1146,10 +1146,15 @@ function startFallback() {
   dom.status.textContent += '  •  drag to look, arrows to turn (pointer lock unavailable in this browser)';
 
   // Drag with the mouse / touch to look around. Track button state so we only
-  // rotate while a button is held — otherwise the cursor stays usable.
+  // rotate while a button is held — otherwise the cursor stays usable. The
+  // `active` guard ignores drags while paused (pause-overlay background clicks
+  // now pass through to the canvas).
   let dragging = false;
   let lastX = 0, lastY = 0;
-  const onDown = (x, y) => { dragging = true; lastX = x; lastY = y; };
+  const onDown = (x, y) => {
+    if (!active) return;
+    dragging = true; lastX = x; lastY = y;
+  };
   const onMove = (x, y) => {
     if (!dragging) return;
     const dx = x - lastX, dy = y - lastY;
@@ -1222,6 +1227,10 @@ function populateDestinations(landmarks) {
     }[lm.kind] || 'Landmark';
     btn.innerHTML = `${lm.name}<span class="kind">${kindLabel}</span>`;
     btn.addEventListener('click', () => {
+      // Clicking a landmark while paused (Esc) also resumes the game, so the
+      // teleport takes effect — the frame loop drives camera/HUD/minimap and
+      // only runs when active.
+      if (!active) resumeGame();
       const ok = teleportTo(lm.x, lm.z);
       dom.status.textContent = ok
         ? `Teleported to ${lm.name}`
@@ -1522,12 +1531,17 @@ async function boot() {
     dom.overlay.hidden = true;   // never block the scene; keep the element for
                                  // the pointerlock 'unlock' (pause) handler.
 
-    // Persistent resume handler. After Esc pauses the game, clicking the
-    // overlay resumes it. The same handler attempts a pointer-lock upgrade.
-    // (Resume-on-keypress is handled by the keydown dispatcher in section 9.)
-    const onInteract = () => {
+    // Persistent resume handler. After Esc pauses the game, any click resumes
+    // (the pause overlay's background passes clicks through, so this fires for
+    // UI-panel clicks too). Clicks that land on a UI panel are NOT turned into
+    // pointer-lock requests — grabbing the pointer mid-click can swallow the
+    // panel button's own click event (e.g. destination teleports).
+    const UI_PANELS = '#destinations, #viewToggle, #minimapWrap, #inputDebug';
+    const onInteract = (e) => {
       // If paused, resume first.
       if (!active) resumeGame();
+      // Don't hijack UI-panel clicks into pointer-lock requests.
+      if (e && e.target && e.target.closest && e.target.closest(UI_PANELS)) return;
       // Try to upgrade to pointer lock (no-op if unsupported / already locked).
       if (!controls.isLocked) {
         try {

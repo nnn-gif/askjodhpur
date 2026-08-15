@@ -32,13 +32,23 @@
       pointer-events: none; z-index: 5;
     }
 
-    /* "Click to walk" overlay. Pointer Lock requires a user gesture, so we
-       must NOT start until the user clicks. See README "Why a click overlay". */
+    /* Pause overlay (shown when Esc releases pointer lock / pauses the game).
+       The DIM BACKGROUND passes clicks through (pointer-events:none) so the
+       destinations panel, minimap, etc. stay clickable while paused — pause
+       behaves like a menu mode, not a blocker. Only the centered card captures
+       clicks (to resume). Without this, the full-screen overlay at z-index 10
+       sat ON TOP of the z-6 destinations panel and swallowed every landmark
+       click while paused. */
     #overlay {
       position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
-      background: rgba(0,0,0,.55); color: #fff; text-align: center; z-index: 10; cursor: pointer;
+      background: rgba(0,0,0,.55); color: #fff; text-align: center; z-index: 10;
+      pointer-events: none;   /* background: clicks fall through to the UI below */
     }
-    #overlay .panel { max-width: 460px; padding: 2rem; }
+    #overlay .panel {
+      max-width: 460px; padding: 2rem;
+      pointer-events: auto;   /* the card itself is clickable → resume */
+      background: rgba(0,0,0,.45); border-radius: 10px; cursor: pointer;
+    }
     #overlay h1 { margin: 0 0 .5rem; font-size: 1.6rem; }
     #overlay p  { margin: .35rem 0; opacity: .9; }
     #overlay .keys { margin-top: 1rem; font-size: .9rem; opacity: .8; }
@@ -139,9 +149,8 @@
 
   <div id="overlay" hidden>
     <div class="panel">
-      <h1>🚶 Walk Jodhpur</h1>
-      <p>A walkable 3D map of Jodhpur, Rajasthan, built from live OpenStreetMap data.</p>
-      <p style="opacity:.7;font-size:.85rem">Loading the city — it'll start automatically when ready.</p>
+      <h1>⏸ Paused</h1>
+      <p>Walk Jodhpur — a walkable 3D map built from OpenStreetMap data.</p>
       <div class="keys">
         <kbd>W</kbd> <kbd>A</kbd> <kbd>S</kbd> <kbd>D</kbd> — move &nbsp;•&nbsp;
         Mouse / drag — look &nbsp;•&nbsp;
@@ -149,7 +158,10 @@
         <kbd>Shift</kbd> — run &nbsp;•&nbsp;
         <kbd>V</kbd> — switch first / third person
       </div>
-      <p style="margin-top:1rem;font-weight:600">Click to start (or just wait a moment)</p>
+      <p style="opacity:.8;font-size:.85rem;margin-top:.6rem">
+        The 🚩 gates &amp; landmarks panel on the left stays clickable while paused.
+      </p>
+      <p style="margin-top:1rem;font-weight:600">Click this card — or press a movement key — to resume</p>
     </div>
   </div>
 
@@ -202,6 +214,6 @@
   <!-- `?v=…` defeats caching of the module across releases. Bump this when
        app.js changes and you want every user (and embedded webview) to pick
        up the new code without a manual hard-reload. -->
-  <script type="module" src="./app.js?v=2026-08-12-19"></script>
+  <script type="module" src="./app.js?v=2026-08-12-20"></script>
 </body>
 </html>

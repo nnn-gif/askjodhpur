@@ -261,5 +261,6 @@ This is a demo, not GTA VI. Known gaps and where to push next:
 
 ## File-by-file pointers
 
-- **`index.html`** — page markup, the import map that loads three.js, the click-to-start overlay (required for pointer lock), HUD, and crosshair. Read top to bottom; it's mostly HTML.
-- **`app.js`** — every technique above, in numbered sections (0–8). Heavily commented; the comments are the real documentation. Start at the top and follow the pipeline: fetch → project → extrude → walk.
+- **`index.html`** — page markup, the import map that loads three.js, the click-to-start overlay (required for pointer lock), HUD, minimap + destinations + view-toggle UI, and crosshair. Read top to bottom; it's mostly HTML.
+- **`app.js`** — every technique above, in numbered sections (0–13). Heavily commented; the comments are the real documentation. The sections follow the pipeline: `0` config → `1` projection → `2` OSM fetch → `3` scene → `4` city geometry → `5` collision → `6` minimap → `7` avatar → `8` player/view → `9` controls → `10` destinations → `11` place lookup → `12` frame loop → `13` boot.
+  The frame loop (§12) is deliberately decomposed: `animate()` computes the shared per-frame values (camera forward, player yaw — once per frame, after turning) and delegates to `updateTurning` / `updateMovement` / `updateCamera` / `updateHud` / `updateMinimap`, each of which is independently readable and can't kill the loop.

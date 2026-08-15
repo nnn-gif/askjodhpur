@@ -6,15 +6,20 @@
 // every step. The README explains *why* each choice was made; the comments
 // here explain *how*.
 //
-// Pipeline:
-//   1. Fetch real building + road geometry for Jodhpur from the Overpass API
-//      (OpenStreetMap's read endpoint).
-//   2. Convert latitude/longitude into 3D scene coordinates (equirectangular
-//      projection centered on the city).
-//   3. Extrude each building footprint into a 3D box; lay roads as flat ribbons.
-//   4. Set up a first-person camera with PointerLockControls (mouse-look + WASD).
-//   5. Run a frame loop that moves the player, applies gravity, and stops them
-//      from walking through buildings (sphere-vs-AABB collision).
+// Pipeline (section numbers match the sections below):
+//   2.  Fetch real building + road geometry for Jodhpur from the Overpass API
+//       (OpenStreetMap's read endpoint), plus gates/landmarks for the
+//       destinations panel.
+//   1.  Convert latitude/longitude into 3D scene coordinates (equirectangular
+//       projection centered on the city).
+//   4.  Extrude each building footprint into a 3D block; lay roads as flat
+//       ribbons sized by road type.
+//   9.  Wire controls: pointer-lock mouse-look with a drag-to-look fallback,
+//       WASD movement, first/third-person view toggle.
+//   12. Run a frame loop that moves the player, resolves collision against
+//       real building footprints, places the camera/avatar per view mode,
+//       and updates the HUD + minimap.
+//   13. Boot: load, build, go.
 // =============================================================================
 
 import * as THREE from 'three';
@@ -23,6 +28,11 @@ import { PointerLockControls } from 'three/addons/controls/PointerLockControls.j
 // -----------------------------------------------------------------------------
 // 0. Configuration
 // -----------------------------------------------------------------------------
+// All tuning scalars live here so there's one place to look. Feature-specific
+// lookup tables (BLUE_PALETTE, ROAD_STYLE) stay co-located with their builders
+// in section 4, where they're most readable.
+
+// --- Geographic --------------------------------------------------------------
 
 // The geographic center of the area we want to walk. Jodhpur's old city sits
 // roughly here (near the Mehrangarh Fort / Clock Tower area). All lat/lon
@@ -44,22 +54,86 @@ const BBOX = {
 // radii, and walking speeds physically meaningful.
 const METERS_PER_DEG_LAT = 111320;
 
-// Player physics constants, in meters / seconds.
+// --- Player physics (meters / seconds) ----------------------------------------
+
 const EYE_HEIGHT     = 1.7;   // average human eye height
 const WALK_SPEED     = 4.5;   // brisk pace (~16 km/h) — zippy enough to enjoy the city
 const RUN_SPEED      = 14.0;  // sprint (hold Shift) — covers the 3 km map quickly
-const PLAYER_RADIUS  = 0.4;   // collision sphere radius
-const GRAVITY        = 20.0;  // m/s^2, used only if we add steps/jumps later
+const PLAYER_RADIUS  = 0.4;   // collision clearance from walls
 
-// Third-person view tuning. The camera sits this far BEHIND the avatar and
-// this high above the avatar's feet, and looks at the avatar's upper body.
-// See README "Character / third-person".
+// --- Third-person view tuning --------------------------------------------------
+// The camera sits this far BEHIND the avatar, this high above the avatar's
+// feet, and looks at the avatar's upper body. See README "Character".
+
 const THIRD_PERSON_DIST   = 4.5;   // camera distance behind the avatar, meters
 const THIRD_PERSON_HEIGHT = 2.2;   // camera height above avatar feet, meters
 const AVATAR_LOOK_HEIGHT  = 1.2;   // where the camera aims on the avatar (chest)
 
+// --- Overpass reliability -------------------------------------------------------
+// The public Overpass service is free and shared. Heavy queries (a ~3 km city
+// box returns ~8 MB / thousands of buildings) intermittently fail with HTTP
+// 429 (rate limit), 503, or 504 (gateway timeout), and network blips surface
+// as ERR_NETWORK_CHANGED / "Failed to fetch". To stay robust the loader:
+//   1. tries several mirrors in order (the main DE server and the FR mirror),
+//   2. retries each mirror a few times on transient errors,
+//   3. if every mirror fails on the full bbox, shrinks the bbox and retries,
+//      on the assumption that *some* of the city beats *none* of it.
+// kumi.systems was dropped because it was unreachable at the time of writing.
+
+const OVERPASS_MIRRORS = [
+  'https://overpass-api.de/api/interpreter',
+  'https://overpass.openstreetmap.fr/api/interpreter',
+];
+const TRANSIENT_STATUS = new Set([429, 500, 502, 503, 504]);
+const ATTEMPTS_PER_MIRROR = 4;
+const RETRY_DELAY_MS = 2500;
+
+// --- Minimap --------------------------------------------------------------------
+
+const MINIMAP_SIZE_PX     = 200;   // visible canvas size (square)
+const MINIMAP_VIEW_METERS = 160;   // world meters across the visible window
+
+// --- Place-name lookup (Nominatim reverse geocode) -------------------------------
+// Nominatim's usage policy is MAX 1 request/second; we throttle far below that.
+
+const NOMINATIM = 'https://nominatim.openstreetmap.org/reverse';
+const PLACE_REFRESH_MS   = 3000;   // min time between lookups
+const PLACE_REFRESH_DIST = 15;     // min meters moved before re-querying
+const PLACE_ZOOM         = 18;     // street-level detail (road + neighbourhood)
+
+// --- Input ----------------------------------------------------------------------
+
+// Keys that resume the game from the Esc-pause screen. Movement/look keys, but
+// not modifier-only presses.
+const RESUME_KEYS = [
+  'KeyW', 'KeyA', 'KeyS', 'KeyD',
+  'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight',
+  'KeyQ', 'KeyE',
+];
+
+// --- DOM element references -------------------------------------------------------
+// Gathered in one place instead of getElementById calls sprinkled throughout.
+// (The module script runs at the end of <body>, so the DOM exists by now.)
+
+const dom = {
+  app:         document.getElementById('app'),
+  overlay:     document.getElementById('overlay'),
+  loading:     document.getElementById('loading'),
+  hud:         document.getElementById('hud'),
+  status:      document.getElementById('status'),
+  crosshair:   document.getElementById('crosshair'),
+  viewToggle:  document.getElementById('viewToggle'),
+  inputDebug:  document.getElementById('inputDebug'),
+  minimapWrap: document.getElementById('minimapWrap'),
+  minimap:     document.getElementById('minimap'),
+  destinations: document.getElementById('destinations'),
+  destList:    document.getElementById('destList'),
+  destCount:   document.getElementById('destCount'),
+  destHeader:  document.getElementById('destHeader'),
+};
+
 // -----------------------------------------------------------------------------
-// 1. Lat/lon → scene coordinates
+// 1. Geographic projection: lat/lon ↔ scene coordinates
 // -----------------------------------------------------------------------------
 //
 // A globe's coordinates can't be used directly in a flat 3D scene. We use the
@@ -81,41 +155,25 @@ function lonLatToXY(lon, lat) {
   return [x, y];
 }
 
+// Inverse of lonLatToXY — used by the HUD + place lookups.
+function scenePosToLatLon(pos) {
+  const lat = ORIGIN.lat + pos.z / METERS_PER_DEG_LAT;
+  const lon = ORIGIN.lon + pos.x / (METERS_PER_DEG_LAT * cosLat);
+  return { lat, lon };
+}
+
 // -----------------------------------------------------------------------------
-// 2. Fetch OSM data from the Overpass API
+// 2. OSM data fetch (Overpass API)
 // -----------------------------------------------------------------------------
 //
 // Overpass is OpenStreetMap's read-only query API. We send it Overpass QL and
 // get back GeoJSON-ish elements: ways (ordered lists of lat/lon nodes) tagged
 // with things like building=yes, highway=residential, building:levels=3.
 //
-// We request both buildings and roads in one query (the union `(...)`) so we
-// pay only one network round-trip. `out geom` embeds each way's coordinates
-// inline — without it we'd have to resolve node IDs separately, doubling the
-// number of requests.
-//
-// Reliability: the public Overpass service is free and shared. Heavy queries
-// (a ~3 km city box returns ~8 MB / thousands of buildings) intermittently
-// fail with HTTP 429 (rate limit), 503, or 504 (gateway timeout) — exactly
-// the "504 Gateway Timeout" you'll see under load. To stay robust the loader:
-//   1. tries several mirrors in order (the main DE server and the FR mirror),
-//   2. retries each mirror a few times on transient errors,
-//   3. if every mirror fails on the full bbox, shrinks the bbox and retries,
-//      on the assumption that *some* of the city beats *none* of it.
-// kumi.systems was dropped because it was unreachable at the time of writing.
-
-const OVERPASS_MIRRORS = [
-  'https://overpass-api.de/api/interpreter',
-  'https://overpass.openstreetmap.fr/api/interpreter',
-];
-const TRANSIENT_STATUS = new Set([429, 500, 502, 503, 504]);
-// More retries + longer backoff than you'd usually need, because the public
-// Overpass service is spiky: some days a full-city query takes 2s, other days
-// (under load, or during a network blip) connections get reset with
-// ERR_NETWORK_CHANGED and need several seconds to recover before a retry can
-// succeed. Riding that out here is better than making the user refresh.
-const ATTEMPTS_PER_MIRROR = 4;
-const RETRY_DELAY_MS = 2500;
+// The main query requests both buildings and roads in one call (the union
+// `(...)`) so we pay only one network round-trip. `out geom` embeds each way's
+// coordinates inline — without it we'd have to resolve node IDs separately,
+// doubling the number of requests.
 
 function buildOverpassQuery(bbox) {
   // bbox defaults to the full city box; a smaller bbox can be passed in by the
@@ -225,8 +283,8 @@ async function fetchOSM(onStatus) {
 // Fetch named gates + major landmarks for the "destinations" panel — the list
 // of places the user can click to teleport to. We query OSM for the things that
 // make useful navigation targets in a historic city like Jodhpur: city gates
-// (the old-city "pol" gates), the fort, palaces, named attractions, and major
-// temples. Results are filtered to those with a name and converted to scene
+// (the old-city "pol" gates), the fort, palaces, named attractions, and
+// memorials. Results are filtered to those with a name and converted to scene
 // XY so teleport can move `playerPos` directly.
 //
 // This is a SEPARATE, much smaller query than the building/road one, run after
@@ -284,7 +342,9 @@ async function fetchLandmarks() {
         return Math.hypot(a.x, a.z) - Math.hypot(b.x, b.z);
       });
       return out;
-    } catch (e) { /* try next mirror */ }
+    } catch (e) {
+      console.warn(`Landmarks fetch failed on ${mirror}:`, e.message);
+    }
   }
   return [];   // non-fatal: panel just won't populate
 }
@@ -312,7 +372,7 @@ const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2)); // cap at 2x for perf
 renderer.shadowMap.enabled = true;
-document.getElementById('app').appendChild(renderer.domElement);
+dom.app.appendChild(renderer.domElement);
 
 window.addEventListener('resize', () => {
   camera.aspect = window.innerWidth / window.innerHeight;
@@ -340,13 +400,9 @@ sun.shadow.camera.near = 1;
 sun.shadow.camera.far = 400;
 scene.add(sun);
 
-// -----------------------------------------------------------------------------
-// 4. Build the ground plane
-// -----------------------------------------------------------------------------
-//
-// A large textured-tone plane represents the ground. We tint it a warm sandy
-// color to evoke Jodhpur's desert setting (it's called the Sun City / Blue City).
-
+// --- Ground plane -------------------------------------------------------------
+// A large plane represents the ground, tinted a warm sandy color to evoke
+// Jodhpur's desert setting (the Sun City / Blue City).
 const groundGeo = new THREE.PlaneGeometry(4000, 4000);
 const groundMat = new THREE.MeshStandardMaterial({ color: 0xc9b08a, roughness: 1 });
 const ground = new THREE.Mesh(groundGeo, groundMat);
@@ -356,11 +412,12 @@ ground.receiveShadow = true;
 scene.add(ground);
 
 // -----------------------------------------------------------------------------
-// 5. Build 3D geometry from OSM data
+// 4. World geometry from OSM data (buildings + roads)
 // -----------------------------------------------------------------------------
+
+// --- Buildings -----------------------------------------------------------------
 //
-// This is the core of the "city map". Each OSM building is a closed polygon of
-// lat/lon points. We:
+// Each OSM building is a closed polygon of lat/lon points. We:
 //   - convert each point to scene meters,
 //   - build a THREE.Shape from the polygon,
 //   - extrude it upward by the building's height to get a solid block.
@@ -389,7 +446,7 @@ function buildingHeight(tags) {
 // actual footprint. In a dense old city like Jodhpur's, narrow lanes between
 // buildings get "filled in" by overlapping bounding boxes and become
 // un-walkable, even though they're open ground. Storing the real polygon makes
-// the collision match what you see.
+// the collision match what you see. (See section 5 for the tests.)
 const colliders = [];
 
 // A palette leaning into Jodhpur's famous "Blue City" old-town colors, with a
@@ -459,11 +516,12 @@ function buildBuildings(buildings) {
   return built;
 }
 
-// Roads: draw each highway as a FLAT RIBBON (a quad) lying on the ground, with
+// --- Roads -----------------------------------------------------------------------
+//
+// Each highway is drawn as a FLAT RIBBON (a quad) lying on the ground, with
 // width based on road type. Earlier these were 1-pixel lines, which vanished
 // against the sandy ground at any distance — making the street network, the
-// thing you actually navigate by, unreadable. Ribbons make roads a real,
-// visible part of the world.
+// thing you actually navigate by, unreadable.
 //
 // Width and color come from the highway=* tag:
 //   trunk/primary  → wide, light gray (main arteries)
@@ -499,6 +557,7 @@ const ROAD_STYLE = {
   cycleway:     [1.5, 0xb89a6a],
 };
 const DEFAULT_ROAD_STYLE = [3.0, 0x70706e];
+const ROAD_Y = 0.06;                     // just above ground to prevent z-fighting
 
 function roadWidth(tags) {
   // If the road has an explicit width tag, honor it; otherwise use the type.
@@ -512,11 +571,19 @@ function roadColor(tags) {
   return (ROAD_STYLE[hw] || DEFAULT_ROAD_STYLE)[1];
 }
 
+// Cache materials per color so roads of the same type share one material.
+const _roadMatCache = Object.create(null);
+function roadMaterial(color) {
+  if (!_roadMatCache[color]) {
+    _roadMatCache[color] = new THREE.MeshBasicMaterial({ color, roughness: 1 });
+  }
+  return _roadMatCache[color];
+}
+
 function buildRoads(roads) {
   // Group vertices by color so we can build one BufferGeometry per material
   // (cheap to render; avoids one draw call per road).
-  const byColor = Object.create(null);   // colorHex -> { verts: [], idx: [], mat: null }
-  const ROAD_Y = 0.06;                   // just above ground to prevent z-fighting
+  const byColor = Object.create(null);   // colorHex -> { verts: [], idx: [] }
 
   for (const r of roads) {
     const g = r.geometry;
@@ -527,7 +594,7 @@ function buildRoads(roads) {
     const color = roadColor(tags);
     let bucket = byColor[color];
     if (!bucket) {
-      bucket = { verts: [], idx: [], color };
+      bucket = { verts: [], idx: [] };
       byColor[color] = bucket;
     }
 
@@ -565,22 +632,72 @@ function buildRoads(roads) {
     geo.setAttribute('position', new THREE.Float32BufferAttribute(bucket.verts, 3));
     geo.setIndex(bucket.idx);
     geo.computeBoundingSphere();   // helps frustum culling
-    const mesh = new THREE.Mesh(geo, roadMaterial(parseInt(color)));
-    scene.add(mesh);
+    scene.add(new THREE.Mesh(geo, roadMaterial(parseInt(color))));
   }
-}
-
-// Cache materials per color so roads of the same type share one material.
-const _roadMatCache = Object.create(null);
-function roadMaterial(color) {
-  if (!_roadMatCache[color]) {
-    _roadMatCache[color] = new THREE.MeshBasicMaterial({ color, roughness: 1 });
-  }
-  return _roadMatCache[color];
 }
 
 // -----------------------------------------------------------------------------
-// 5b. Minimap (top-down map)
+// 5. Collision (against real building footprints)
+// -----------------------------------------------------------------------------
+//
+// Movement resolution is AXIS-SEPARATED: we try the X move and the Z move
+// independently so a wall on one axis doesn't kill all movement (lets you
+// slide along buildings) — the same trick most retro FPS games used.
+//
+// For each candidate position:
+//   - broad phase: skip buildings whose expanded AABB the player isn't in,
+//   - narrow phase: collide if inside the real footprint OR within
+//     PLAYER_RADIUS of any wall edge.
+
+// Classic ray-casting point-in-polygon test. Fast and good enough for building
+// footprints (which are simple polygons without holes here).
+function pointInPoly(x, z, poly) {
+  let inside = false;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    const xi = poly[i][0], zi = poly[i][1];
+    const xj = poly[j][0], zj = poly[j][1];
+    if (((zi > z) !== (zj > z)) &&
+        (x < (xj - xi) * (z - zi) / (zj - zi) + xi)) {
+      inside = !inside;
+    }
+  }
+  return inside;
+}
+
+// Distance from point (x,z) to the nearest edge of a polygon. Used to give the
+// player a radius of clearance from walls — without this you'd clip right up
+// against building faces.
+function distToPolyEdge(x, z, poly) {
+  let best = Infinity;
+  for (let i = 0; i < poly.length; i++) {
+    const ax = poly[i][0], az = poly[i][1];
+    const bx = poly[(i + 1) % poly.length][0], bz = poly[(i + 1) % poly.length][1];
+    const dx = bx - ax, dz = bz - az;
+    const t = Math.max(0, Math.min(1, ((x - ax) * dx + (z - az) * dz) / (dx * dx + dz * dz)));
+    const px = ax + t * dx, pz = az + t * dz;
+    const d = Math.hypot(x - px, z - pz);
+    if (d < best) best = d;
+  }
+  return best;
+}
+
+function resolveCollision(nextPos) {
+  // Broad phase: skip the polygon math for buildings whose expanded AABB the
+  // player isn't even touching. In a dense city this still scans every
+  // collider, but the AABB test is ~4 comparisons and branch-predicts well.
+  for (const c of colliders) {
+    if (nextPos.x <= c.minX || nextPos.x >= c.maxX ||
+        nextPos.z <= c.minZ || nextPos.z >= c.maxZ) continue;
+    // Narrow phase: the player is near this building's AABB. Collide if they
+    // are inside the real footprint OR within PLAYER_RADIUS of any wall.
+    if (pointInPoly(nextPos.x, nextPos.z, c.poly)) return true;
+    if (distToPolyEdge(nextPos.x, nextPos.z, c.poly) < PLAYER_RADIUS) return true;
+  }
+  return false;
+}
+
+// -----------------------------------------------------------------------------
+// 6. Minimap (top-down map)
 // -----------------------------------------------------------------------------
 //
 // A small canvas in the corner showing the city from above so the player can
@@ -597,21 +714,20 @@ function roadMaterial(color) {
 //     pointing where they look) on top.
 //   - "North up": the minimap's +Z (north) points up, +X (east) points right —
 //     matching the scene axes. The simplest mental model.
-//   - Zoom: the minimap shows a ~160 m radius around the player. The full 3 km
-//     city in 200 px would be ~15 m/px, too coarse to read locally; a player-
-//     centred zoomed view is far more useful for "where am I right now".
+//   - Zoom: the minimap shows a ~160 m window around the player (see
+//     MINIMAP_VIEW_METERS). The full 3 km city in 200 px would be ~15 m/px,
+//     too coarse to read locally.
 
 const MINIMAP = {
   el: null,          // visible <canvas>
   ctx: null,         // its 2D context
   base: null,        // offscreen canvas with the static city map
   baseCtx: null,
-  size: 200,         // pixel size (square)
-  viewMeters: 160,   // world meters across the visible window at the player
+  transform: null,   // { minX, maxZ, PX_PER_M } world→pixel params, set by renderMinimapBase
 };
 
 function initMinimap() {
-  MINIMAP.el = document.getElementById('minimap');
+  MINIMAP.el = dom.minimap;
   MINIMAP.ctx = MINIMAP.el.getContext('2d');
   // Offscreen canvas holds the full-city static layer. Sized so that the whole
   // loaded bbox (~3 km) fits; we only blit the window around the player.
@@ -691,15 +807,16 @@ function renderMinimapBase() {
 }
 
 // Per-frame minimap draw: blit the static map centred on the player, then draw
-// the player marker. px,py = player's pixel location in the offscreen image.
+// the player marker. `heading` is the player yaw in radians, where 0 = facing
+// -Z (north). See the player-yaw derivation in section 12's frame loop.
 function drawMinimap(playerX, playerZ, heading) {
   const { minX, maxZ, PX_PER_M } = MINIMAP.transform;
   const playerPX = (playerX - minX) * PX_PER_M;
   const playerPY = (maxZ - playerZ) * PX_PER_M;
 
   // Source rectangle in the offscreen image: a window around the player, sized
-  // so that `viewMeters` of world spans the visible canvas.
-  const halfWorld = MINIMAP.viewMeters / 2;
+  // so that MINIMAP_VIEW_METERS of world spans the visible canvas.
+  const halfWorld = MINIMAP_VIEW_METERS / 2;
   const halfSrcPx = halfWorld * PX_PER_M;
   let sx = playerPX - halfSrcPx;
   let sy = playerPY - halfSrcPx;
@@ -715,20 +832,16 @@ function drawMinimap(playerX, playerZ, heading) {
 
   // Visible canvas: clear, then draw the source window scaled to fill it.
   const ctx = MINIMAP.ctx;
-  const S = MINIMAP.size;
+  const S = MINIMAP_SIZE_PX;
   ctx.fillStyle = '#c9b08a';
   ctx.fillRect(0, 0, S, S);
   ctx.drawImage(MINIMAP.base, sx, sy, sw, sh, 0, 0, S, S);
 
-  // Player marker: a triangle pointing in the facing direction. `heading` is
-  // the camera yaw in radians (0 = looking toward -Z = north). On the minimap,
-  // north is up, so we convert yaw to a 2D heading: north (looking -Z) → up.
-  //   Forward direction in world XZ for yaw y: (sin y, -cos y) on (X, Z).
-  //   On the minimap image, +X is right and +Z(north) is up → forward pixel
-  //   vector is (sin y, -(-cos y)) = (sin y, cos y)... simplify below.
+  // Player marker: a triangle pointing in the facing direction.
+  // World forward (X,Z) for yaw y = (sin y, -cos y). On the minimap image,
+  // +X is right and north (+Z... i.e. looking -Z means image-up) — the image
+  // forward vector works out to (sin y, cos y).
   const cx = S / 2, cy = S / 2;
-  // Convert world forward to image forward. World forward (X,Z) = (sin y, -cos y).
-  // Image: X→right, Z→up means image-y = -Z. So image forward = (sin y, cos y).
   const fx = Math.sin(heading);
   const fy = Math.cos(heading);
   // Perpendicular for the triangle base.
@@ -747,41 +860,20 @@ function drawMinimap(playerX, playerZ, heading) {
 }
 
 // -----------------------------------------------------------------------------
-// 5c. Character avatar (third-person, Vice-City style)
+// 7. Character avatar (third-person, Vice-City style)
 // -----------------------------------------------------------------------------
 //
 // A small procedural humanoid built entirely from THREE primitives — no
-// external model files, no textures, no network dependency. Toggle into/out of
-// third-person with the V key (see the keydown handler in the controls
-// section). The figure has pivotable limbs so we can run a simple walk cycle.
+// external model files, no textures, no network dependency. Built lazily on
+// the first switch to third-person (section 8) so first-person play pays
+// nothing until the user opts in. The figure has pivotable limbs so we can
+// run a simple walk cycle.
 //
 // Why procedural blocks: it matches the demo's "no build step, no assets"
 // philosophy and can never 404. The geometry is intentionally chunky/low-poly,
 // which reads fine at the small size the avatar occupies on screen.
 
-// Module state for the character. `avatar` is built lazily on the first toggle
-// to V so first-person play pays nothing until the user opts in.
-let thirdPerson = false;     // current view mode
 let avatar = null;           // the THREE.Group humanoid (null until built)
-
-// A canonical player position vector that BOTH view modes share. The frame
-// loop moves this (with collision), then positions the camera relative to it.
-// In first-person the camera sits at playerPos + eye height; in third-person
-// the camera sits behind/above and the avatar mesh sits at playerPos.
-// Initialized to the spawn point at feet level (y=0).
-const playerPos = new THREE.Vector3(1, 0, -24);
-
-// Read the player's yaw (heading) directly from the camera's world direction.
-// This is authoritative in BOTH control modes: in pointer-lock mode the
-// `yaw` variable is stale (PointerLockControls writes the quaternion), so we
-// derive yaw from the camera instead. Same formula the minimap already uses.
-// Returns radians where 0 = facing -Z (north). Forward in world XZ for this
-// yaw is (sin yaw, 0, -cos yaw).
-const _fwdTmp = new THREE.Vector3();
-function getPlayerYaw() {
-  camera.getWorldDirection(_fwdTmp);
-  return Math.atan2(_fwdTmp.x, -_fwdTmp.z);
-}
 
 // Build the humanoid. Origin is at the avatar's FEET (y=0). We return a Group
 // plus stash limb references on it (.userData) so the walk cycle can swing
@@ -874,13 +966,66 @@ function animateAvatar(dt, moving, speed) {
 }
 
 // -----------------------------------------------------------------------------
-// 5d. Destinations panel (teleport to gates + landmarks)
+// 8. Player & view (position, facing, teleport, view toggle)
 // -----------------------------------------------------------------------------
 //
-// A collapsible list of Jodhpur's historic gates and major landmarks, fetched
-// from OpenStreetMap. Click a name and the player teleports there instantly —
-// useful for getting oriented in a dense city where walking between landmarks
-// takes a while. See README "Destinations / teleport".
+// The canonical player state. The frame loop (section 12) moves `playerPos`
+// (with collision), then positions the CAMERA relative to it based on view
+// mode: first-person sits at playerPos + eye height; third-person sits
+// behind/above with the avatar mesh at playerPos. This decoupling is what
+// lets both view modes share one movement system.
+
+// The player's position at feet level (y=0 in third-person, eye height in
+// first-person). Spawn: a verified point on the "Layakam Mohalla" lane — the
+// naive origin (0,0) lands inside a building footprint in dense central
+// Jodhpur and traps the player. This spot has ~2 m of clearance.
+const playerPos = new THREE.Vector3(1, 0, -24);
+
+// `thirdPerson` selects the view mode. `active` (section 9) gates all input.
+let thirdPerson = false;
+
+// Head-bob phase for first-person walking (see updateCamera, section 12).
+let bobPhase = 0;
+
+// Sync the camera to the spawn point once at startup; every frame after this
+// the frame loop owns camera placement.
+camera.position.set(playerPos.x, EYE_HEIGHT, playerPos.z);
+
+// Manual yaw/pitch used by the no-lock fallback look (section 9). In
+// pointer-lock mode PointerLockControls writes the camera quaternion directly
+// and these go stale — which is why the frame loop derives the player's yaw
+// from the camera's world direction instead of reading `yaw`.
+let yaw = 0;
+let pitch = 0;
+const PITCH_LIMIT = Math.PI / 2 - 0.05;
+
+// Build the camera orientation from our own yaw/pitch. Order matters: in
+// three.js, Euler 'YXZ' applies yaw (Y) then pitch (X), which is exactly the
+// FPS camera convention (look around horizontally, then up/down).
+function applyFallbackLook() {
+  camera.rotation.order = 'YXZ';
+  camera.rotation.set(pitch, yaw, 0);
+}
+
+// Toggle between first- and third-person view. Called by the V key (section 9)
+// and the on-screen #viewToggle button (essential on touch devices and in
+// webviews that swallow synthetic key events). Builds the avatar lazily on
+// first toggle so first-person play pays nothing until the user opts in.
+function toggleView() {
+  if (!active) return;
+  if (!avatar) {
+    avatar = buildAvatar();
+    scene.add(avatar);
+  }
+  thirdPerson = !thirdPerson;
+  avatar.visible = thirdPerson;
+  dom.status.textContent = thirdPerson
+    ? 'Third-person view — V to switch back'
+    : 'First-person view — V for third-person';
+  if (dom.viewToggle) {
+    dom.viewToggle.textContent = thirdPerson ? '🚶 Third person (V)' : '👁 First person (V)';
+  }
+}
 
 // Teleport the player to scene (x, z). We try a few nearby offsets if the exact
 // point is inside a building (landmarks often sit on/near footprints), so you
@@ -909,162 +1054,52 @@ function teleportTo(x, z) {
   return false;   // every candidate blocked; give up silently
 }
 
-// Build the destinations panel from a list of landmarks. Each item is a button
-// that teleports the player and (if in third-person) keeps the avatar in sync.
-function populateDestinations(landmarks) {
-  const wrap = document.getElementById('destinations');
-  const list = document.getElementById('destList');
-  const count = document.getElementById('destCount');
-  if (!wrap || !list) return;
-  if (!landmarks.length) { wrap.hidden = true; return; }
-
-  list.innerHTML = '';
-  for (const lm of landmarks) {
-    const btn = document.createElement('button');
-    btn.className = 'dest-item';
-    btn.type = 'button';
-    // Friendly kind label.
-    const kindLabel = {
-      city_gate: 'Gate', gate: 'Gate', castle: 'Fort / Palace',
-      attraction: 'Attraction', memorial: 'Memorial',
-    }[lm.kind] || 'Landmark';
-    btn.innerHTML = `${lm.name}<span class="kind">${kindLabel}</span>`;
-    btn.addEventListener('click', () => {
-      const ok = teleportTo(lm.x, lm.z);
-      status.textContent = ok
-        ? `Teleported to ${lm.name}`
-        : `Couldn't land at ${lm.name} (blocked) — try another spot`;
-      // Keep the place-name cache fresh.
-      currentPlace = lm.name;
-    });
-    list.appendChild(btn);
-  }
-  count.textContent = `(${landmarks.length})`;
-  wrap.hidden = false;
-
-  // Collapsible header.
-  const header = document.getElementById('destHeader');
-  header.addEventListener('click', () => wrap.classList.toggle('collapsed'));
-}
-
 // -----------------------------------------------------------------------------
-// 6. First-person controls (PointerLockControls)
+// 9. Controls & input
 // -----------------------------------------------------------------------------
 //
 // PointerLockControls hides the cursor and reads raw mouse movement to rotate
-// the camera — exactly the way FPS games and Minecraft do "mouse look". The
-// browser only allows pointer lock after a user gesture (a click), which is
-// why index.html has a "Click to start" overlay.
+// the camera — exactly the way FPS games do "mouse look". The browser only
+// allows pointer lock after a user gesture (a click).
 //
 // IMPORTANT — why we don't depend on pointer lock:
 // Many embedded webviews (including ZCode's in-app browser, Electron apps,
 // some mobile browsers, and any iframe without allow="pointer-lock") do NOT
 // support the Pointer Lock API. If we gated movement on `controls.isLocked`
-// the demo would silently do nothing on those platforms — "I see the loaded
-// log and nothing happens." So pointer lock is treated as an *enhancement*:
-// when it works we use it for FPS-style mouse-look; when it doesn't, we fall
-// back to drag-to-look + arrow/Q-E turning, and WASD always works.
+// the demo would silently do nothing on those platforms. So pointer lock is
+// treated as an *enhancement*: when it works we use it for FPS-style
+// mouse-look; when it doesn't, we fall back to drag-to-look + arrow/Q-E
+// turning, and WASD always works.
 const controls = new PointerLockControls(camera, document.body);
 
-// Keyboard state. We track pressed keys ourselves rather than letting the
-// controls object move us, so we can mix in run, gravity, and collision.
+// Keyboard state. We track pressed keys ourselves so we can mix in run,
+// collision, and the view toggle. ONE keydown dispatcher handles everything:
+// raw key tracking, the V toggle, and resume-from-pause.
 const keys = Object.create(null);
-// Toggle between first- and third-person view. Shared by the V key and the
-// on-screen #viewToggle button (the button is essential on touch devices and
-// in webviews that swallow synthetic key events). Builds the avatar lazily on
-// first toggle so first-person play pays nothing until the user opts in.
-function toggleView() {
-  if (!active) return;
-  if (!avatar) {
-    avatar = buildAvatar();
-    scene.add(avatar);
-  }
-  thirdPerson = !thirdPerson;
-  avatar.visible = thirdPerson;
-  status.textContent = thirdPerson
-    ? 'Third-person view — V to switch back'
-    : 'First-person view — V for third-person';
-  const btn = document.getElementById('viewToggle');
-  if (btn) btn.textContent = thirdPerson ? '🚶 Third person (V)' : '👁 First person (V)';
-}
-
-addEventListener('keydown', e => {
-  keys[e.code] = true;
-  // V switches view. Built and toggled inside toggleView().
-  if (e.code === 'KeyV') toggleView();
-});
-addEventListener('keyup',   e => { keys[e.code] = false; });
-
-// Live WASD input indicator (#inputDebug). Reflects the `keys` state each frame
-// so you can see whether key events are reaching the page. If a key never
-// lights up while you press it, that key isn't being delivered (focus issue,
-// webview input blocking, or stale cached code).
-const inputSpans = {};
-function setupInputDebug() {
-  const wrap = document.getElementById('inputDebug');
-  if (!wrap) return;
-  for (const el of wrap.querySelectorAll('span[data-k]')) {
-    inputSpans[el.getAttribute('data-k')] = el;
-  }
-  wrap.hidden = false;
-}
-function updateInputDebug() {
-  for (const code in inputSpans) {
-    const el = inputSpans[code];
-    if (keys[code]) el.classList.add('on');
-    else el.classList.remove('on');
-  }
-}
-
-// Start the player on a real street. The naive origin (0,0,0) lands inside a
-// building's footprint in dense central Jodhpur and traps the player. This
-// point was verified to sit on the "Layakam Mohalla" lane with ~2 m of
-// clearance to the nearest building — a genuinely walkable spot. The canonical
-// playerPos (defined with the avatar code) holds the feet-level position;
-// camera placement happens each frame from it, so we just sync the camera here.
-camera.position.set(playerPos.x, EYE_HEIGHT, playerPos.z);
-
-const overlay = document.getElementById('overlay');
-const loading = document.getElementById('loading');
-const hud = document.getElementById('hud');
-const status = document.getElementById('status');
 
 // `active` means "the demo is in interactive mode" — distinct from pointer
 // lock. WASD movement and turning are enabled whenever active is true, even
-// if pointer lock is unavailable.
+// if pointer lock is unavailable. `worldReady` gates resume-from-pause so
+// pressing keys DURING the initial load can't start the game early.
 let active = false;
+let worldReady = false;
 
-// Manual yaw/pitch used by the no-lock fallback. PointerLockControls updates
-// the camera quaternion directly on lock, so these are only read/written in
-// fallback mode. Pitch is clamped so you can't flip upside-down.
-let yaw = 0;
-let pitch = 0;
-const PITCH_LIMIT = Math.PI / 2 - 0.05;
+addEventListener('keydown', e => {
+  keys[e.code] = true;
+  // V switches first/third-person view.
+  if (e.code === 'KeyV') toggleView();
+  // If paused (Esc), any movement/look key resumes — but only once the world
+  // has finished loading.
+  if (!active && worldReady && RESUME_KEYS.includes(e.code)) resumeGame();
+});
+addEventListener('keyup', e => { keys[e.code] = false; });
 
-function applyFallbackLook() {
-  // Build the camera orientation from our own yaw/pitch. Order matters: in
-  // three.js, Euler 'YXZ' applies yaw (Y) then pitch (X), which is exactly the
-  // FPS camera convention (look around horizontally, then up/down).
-  camera.rotation.order = 'YXZ';
-  camera.rotation.set(pitch, yaw, 0);
-}
-
-// --- Pointer-lock path (primary, when supported) ---
-// Engagement (the click/keydown + auto-fallback logic) is wired up in boot()
-// after the world has loaded, so the user can't enter the scene before it's
-// ready. See boot() for why this is gated and why there's an auto-fallback.
+// --- Pointer-lock path (the upgrade, when the browser supports it) ------------
 
 controls.addEventListener('lock', () => {
   active = true;
-  overlay.hidden = true;
-  hud.hidden = false;
-  const viewBtn = document.getElementById('viewToggle');
-  if (viewBtn) {
-    viewBtn.hidden = false;
-    viewBtn.addEventListener('click', toggleView);
-  }
-  setupInputDebug();
-  status.textContent += '  •  mouse-look (pointer lock)';
+  showInteractiveUI();
+  dom.status.textContent += '  •  mouse-look (pointer lock)';
 });
 controls.addEventListener('unlock', () => {
   // Esc / losing pointer lock PAUSES the game instead of stranding the user.
@@ -1073,8 +1108,8 @@ controls.addEventListener('unlock', () => {
   // movement key) resumes via resumeGame() so there's always a way back.
   if (active) {
     active = false;
-    overlay.hidden = false;
-    status.textContent = 'Paused — click or press a key to resume';
+    dom.overlay.hidden = false;
+    dom.status.textContent = 'Paused — click or press a key to resume';
   }
 });
 
@@ -1083,27 +1118,32 @@ controls.addEventListener('unlock', () => {
 function resumeGame() {
   if (active) return;
   active = true;
-  overlay.hidden = true;
-  hud.hidden = false;
-  status.textContent = thirdPerson
+  dom.overlay.hidden = true;
+  dom.hud.hidden = false;
+  dom.status.textContent = thirdPerson
     ? 'Third-person view — V to switch'
     : 'Resumed — drag to look, arrows to turn';
 }
 
-// --- Fallback path (drag-to-look + arrow keys), used when no pointer lock ---
+// Reveal the interactive-mode UI pieces (shared by the pointer-lock and
+// fallback engagement paths so neither duplicates the wiring).
+function showInteractiveUI() {
+  dom.overlay.hidden = true;
+  dom.hud.hidden = false;
+  if (dom.viewToggle) {
+    dom.viewToggle.hidden = false;
+    dom.viewToggle.addEventListener('click', toggleView);
+  }
+  setupInputDebug();
+}
+
+// --- Fallback path (drag-to-look + arrow keys), used when no pointer lock ------
+
 function startFallback() {
   if (active) return;
   active = true;
-  overlay.hidden = true;
-  hud.hidden = false;
-  // Show the view-toggle button now that the demo is interactive.
-  const viewBtn = document.getElementById('viewToggle');
-  if (viewBtn) {
-    viewBtn.hidden = false;
-    viewBtn.addEventListener('click', toggleView);
-  }
-  setupInputDebug();
-  status.textContent += '  •  drag to look, arrows to turn (pointer lock unavailable in this browser)';
+  showInteractiveUI();
+  dom.status.textContent += '  •  drag to look, arrows to turn (pointer lock unavailable in this browser)';
 
   // Drag with the mouse / touch to look around. Track button state so we only
   // rotate while a button is held — otherwise the cursor stays usable.
@@ -1134,20 +1174,80 @@ function startFallback() {
   renderer.domElement.addEventListener('touchend', onUp);
 }
 
+// --- Live WASD input indicator (#inputDebug) -----------------------------------
+//
+// Reflects the `keys` state each frame so you can see whether key events are
+// reaching the page. If a key never lights up while you press it, that key
+// isn't being delivered (focus issue, webview input blocking, or stale cached
+// code).
+
+const inputSpans = {};
+function setupInputDebug() {
+  if (!dom.inputDebug) return;
+  for (const el of dom.inputDebug.querySelectorAll('span[data-k]')) {
+    inputSpans[el.getAttribute('data-k')] = el;
+  }
+  dom.inputDebug.hidden = false;
+}
+function updateInputDebug() {
+  for (const code in inputSpans) {
+    const el = inputSpans[code];
+    if (keys[code]) el.classList.add('on');
+    else el.classList.remove('on');
+  }
+}
+
 // -----------------------------------------------------------------------------
-// 7. Reverse geocoding — show the player's current place name
+// 10. Destinations panel (teleport to gates + landmarks)
 // -----------------------------------------------------------------------------
 //
-// Raw lat/lon in the HUD is meaningless to a human ("you are at 26.298, 73.022"
-// tells you nothing). We resolve the player's position to a readable place name
-// ("Layakam Mohalla • Paota • Jodhpur") using OpenStreetMap's Nominatim
-// reverse-geocode API.
+// A collapsible list of Jodhpur's historic gates and major landmarks, fetched
+// from OpenStreetMap (section 2's fetchLandmarks). Click a name and the player
+// teleports there instantly — useful for getting oriented in a dense city
+// where walking between landmarks takes a while.
+
+function populateDestinations(landmarks) {
+  if (!dom.destinations || !dom.destList) return;
+  if (!landmarks.length) { dom.destinations.hidden = true; return; }
+
+  dom.destList.innerHTML = '';
+  for (const lm of landmarks) {
+    const btn = document.createElement('button');
+    btn.className = 'dest-item';
+    btn.type = 'button';
+    // Friendly kind label.
+    const kindLabel = {
+      city_gate: 'Gate', gate: 'Gate', castle: 'Fort / Palace',
+      attraction: 'Attraction', memorial: 'Memorial',
+    }[lm.kind] || 'Landmark';
+    btn.innerHTML = `${lm.name}<span class="kind">${kindLabel}</span>`;
+    btn.addEventListener('click', () => {
+      const ok = teleportTo(lm.x, lm.z);
+      dom.status.textContent = ok
+        ? `Teleported to ${lm.name}`
+        : `Couldn't land at ${lm.name} (blocked) — try another spot`;
+      // Keep the place-name cache fresh.
+      currentPlace = lm.name;
+    });
+    dom.destList.appendChild(btn);
+  }
+  dom.destCount.textContent = `(${landmarks.length})`;
+  dom.destinations.hidden = false;
+
+  // Collapsible header.
+  dom.destHeader.addEventListener('click', () => dom.destinations.classList.toggle('collapsed'));
+}
+
+// -----------------------------------------------------------------------------
+// 11. Place-name lookup (Nominatim reverse geocode)
+// -----------------------------------------------------------------------------
+//
+// Raw lat/lon in the HUD is meaningless to a human. We resolve the player's
+// position to a readable place name ("Layakam Mohalla • Paota • Jodhpur").
 //
 // Constraints that shape the design:
-//   - Nominatim's usage policy is MAX 1 request/second. We can't query every
-//     frame, so we throttle: at most one lookup per 3 seconds, AND only when
-//     the player has moved >15 m since the last lookup. In practice that's
-//     well under 1 req/s even when running.
+//   - Throttled to ≥ PLACE_REFRESH_MS apart AND ≥ PLACE_REFRESH_DIST moved,
+//     comfortably under Nominatim's 1 req/s policy limit.
 //   - Nominatim requires a meaningful User-Agent, but browsers FORBID setting
 //     User-Agent from fetch(). The default browser UA ("Mozilla/5.0 …") is
 //     accepted by the public instance (verified), so we rely on that.
@@ -1155,11 +1255,6 @@ function startFallback() {
 //     it is allowed despite the cross-origin.
 //   - If a lookup fails (rate-limit, offline), we keep showing the last known
 //     name — never break walking over a missing label.
-
-const NOMINATIM = 'https://nominatim.openstreetmap.org/reverse';
-const PLACE_REFRESH_MS = 3000;     // min time between lookups (≥ Nominatim's 1/s)
-const PLACE_REFRESH_DIST = 15;     // min meters moved before re-querying
-const PLACE_ZOOM = 18;             // street-level detail (road + neighbourhood)
 
 let lastPlacePos = null;           // {x, z} of last lookup in scene coords
 let lastPlaceTime = 0;             // ms timestamp of last lookup
@@ -1172,8 +1267,6 @@ function formatPlace(json) {
   // before country/state to keep it short.
   if (!json) return '';
   const a = json.address || {};
-  // The feature's own name (e.g. a named road or square), falling back to the
-  // road field. Then append suburb/neighbourhood and city if present.
   const parts = [];
   const name = json.name || a.road || a.pedestrian || a.square || a.path;
   if (name) parts.push(name);
@@ -1203,86 +1296,29 @@ async function refreshPlace(lat, lon) {
     }
     // On failure we simply keep the last label; nothing to do.
   } catch (e) {
-    /* network error — keep last label */
+    // Network error — keep the last label, but leave a trace for debugging.
+    console.warn('Place lookup failed:', e.message);
   } finally {
     placeInFlight = false;
     lastPlaceTime = performance.now();
   }
 }
 
-// Convert the player's scene position to lat/lon (inverse of lonLatToXY).
-function scenePosToLatLon(pos) {
-  const lat = ORIGIN.lat + pos.z / METERS_PER_DEG_LAT;
-  const lon = ORIGIN.lon + pos.x / (METERS_PER_DEG_LAT * cosLat);
-  return { lat, lon };
-}
-
 // -----------------------------------------------------------------------------
-// 8. Movement & collision (the frame loop)
+// 12. Frame loop
 // -----------------------------------------------------------------------------
 //
-// Each animation frame:
-//   - compute a forward/right direction from the camera's yaw,
-//   - sum the WASD input into a desired velocity vector,
-//   - attempt to move on X and Z independently so a wall on one axis doesn't
-//     kill all movement (lets you slide along buildings),
-//   - for the candidate position, do a broad-phase AABB check, then a narrow
-//     point-in-polygon + edge-distance check against the real footprint. If
-//     inside or within PLAYER_RADIUS of a wall, cancel that axis' move.
-//
-// Axis-separated resolution is the same trick most retro FPS games used. It's
-// cheap and feels good. A more accurate engine would use swept spheres or a
-// physics library, but that's overkill for a walking demo.
-
-// Classic ray-casting point-in-polygon test. Fast and good enough for building
-// footprints (which are simple polygons without holes here).
-function pointInPoly(x, z, poly) {
-  let inside = false;
-  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
-    const xi = poly[i][0], zi = poly[i][1];
-    const xj = poly[j][0], zj = poly[j][1];
-    if (((zi > z) !== (zj > z)) &&
-        (x < (xj - xi) * (z - zi) / (zj - zi) + xi)) {
-      inside = !inside;
-    }
-  }
-  return inside;
-}
-
-// Distance from point (x,z) to the nearest edge of a polygon. Used to give the
-// player a radius of clearance from walls — without this you'd clip right up
-// against building faces.
-function distToPolyEdge(x, z, poly) {
-  let best = Infinity;
-  for (let i = 0; i < poly.length; i++) {
-    const ax = poly[i][0], az = poly[i][1];
-    const bx = poly[(i + 1) % poly.length][0], bz = poly[(i + 1) % poly.length][1];
-    const dx = bx - ax, dz = bz - az;
-    const t = Math.max(0, Math.min(1, ((x - ax) * dx + (z - az) * dz) / (dx * dx + dz * dz)));
-    const px = ax + t * dx, pz = az + t * dz;
-    const d = Math.hypot(x - px, z - pz);
-    if (d < best) best = d;
-  }
-  return best;
-}
-
-function resolveCollision(nextPos) {
-  // Broad phase: skip the polygon math for buildings whose expanded AABB the
-  // player isn't even touching. In a dense city this still scans every
-  // collider, but the AABB test is ~4 comparisons and branch-predicts well.
-  for (const c of colliders) {
-    if (nextPos.x <= c.minX || nextPos.x >= c.maxX ||
-        nextPos.z <= c.minZ || nextPos.z >= c.maxZ) continue;
-    // Narrow phase: the player is near this building's AABB. Collide if they
-    // are inside the real footprint OR within PLAYER_RADIUS of any wall.
-    if (pointInPoly(nextPos.x, nextPos.z, c.poly)) return true;
-    if (distToPolyEdge(nextPos.x, nextPos.z, c.poly) < PLAYER_RADIUS) return true;
-  }
-  return false;
-}
+// `animate` is the orchestrator: it computes the shared per-frame values
+// (camera forward, player yaw) ONCE, then delegates to one function per
+// concern. Each sub-function is independently readable; none of them can kill
+// the loop (failures are caught and logged, not swallowed silently).
 
 const clock = new THREE.Clock();
-let bobPhase = 0;
+
+// Scratch vectors reused every frame (avoids per-frame allocation churn).
+const _camFwd = new THREE.Vector3();
+const _camFwdFlat = new THREE.Vector3();
+const _move = new THREE.Vector3();
 
 function animate() {
   requestAnimationFrame(animate);
@@ -1290,157 +1326,170 @@ function animate() {
                                                 // when the tab was inactive)
 
   if (active) {
-    // --- turning in fallback mode (pointer-lock mode turns via mouse) ---
-    // Arrow keys / Q-E rotate the view when there's no pointer lock. In
-    // pointer-lock mode these are harmless extras.
-    if (!controls.isLocked) {
-      const turn = (keys['ArrowLeft'] || keys['KeyQ'] ? 1 : 0)
-                 - (keys['ArrowRight'] || keys['KeyE'] ? 1 : 0);
-      if (turn !== 0) {
-        yaw += turn * 1.8 * dt;
-        applyFallbackLook();
-      }
-    }
-
-    // Mirror current key state to the on-screen WASD indicator.
+    updateTurning(dt);
     updateInputDebug();
 
-    // --- desired horizontal velocity from input ---
-    const speed = keys['ShiftLeft'] || keys['ShiftRight'] ? RUN_SPEED : WALK_SPEED;
+    // Shared per-frame derivations, computed AFTER turning so they reflect
+    // this frame's rotation. The camera's world direction is the one source
+    // of truth for orientation in BOTH control modes (in pointer-lock mode
+    // the manual `yaw` variable is stale — PointerLockControls writes the
+    // camera quaternion directly).
+    //
+    //   playerYaw: radians, 0 = facing -Z (north). Forward in world XZ for
+    //              this yaw is (sin yaw, 0, -cos yaw).
+    //   camFwdFlat: the yaw's horizontal unit vector — used for movement and
+    //               the third-person camera offset.
+    camera.getWorldDirection(_camFwd);
+    const playerYaw = Math.atan2(_camFwd.x, -_camFwd.z);
+    _camFwdFlat.copy(_camFwd);
+    _camFwdFlat.y = 0;
+    _camFwdFlat.normalize();                   // keep movement horizontal
 
-    const forward = (keys['KeyW'] || keys['ArrowUp']   ? 1 : 0)
-                  - (keys['KeyS'] || keys['ArrowDown'] ? 1 : 0);
-    const strafe  = (keys['KeyD'] ? 1 : 0) - (keys['KeyA'] ? 1 : 0);
-
-    // Direction vectors from the camera. We read the camera's world direction
-    // (works whether rotation came from PointerLockControls or our yaw/pitch),
-    // then flatten it to keep movement horizontal.
-    const dir = new THREE.Vector3();
-    camera.getWorldDirection(dir);
-    dir.y = 0; dir.normalize();               // keep movement horizontal
-    const right = new THREE.Vector3().crossVectors(dir, camera.up).normalize();
-
-    const move = new THREE.Vector3();
-    move.addScaledVector(dir,   forward * speed * dt);
-    move.addScaledVector(right, strafe  * speed * dt);
-
-    // --- axis-separated collision resolution on the canonical player position ---
-    // We move `playerPos` (shared by both view modes) instead of the camera
-    // directly, then place the camera relative to playerPos based on mode.
-    const tryX = playerPos.clone(); tryX.x += move.x;
-    if (!resolveCollision(tryX)) playerPos.x = tryX.x;
-    const tryZ = playerPos.clone(); playerPos.z += move.z;
-    if (!resolveCollision(tryZ)) playerPos.z = tryZ.z;
-
-    const moving = (forward !== 0 || strafe !== 0);
-
-    // --- place the camera + avatar based on view mode ---
-    // FIRST-PERSON: identical to before the character feature existed — camera
-    //   at eye height with a subtle head-bob while walking. Numerically the
-    //   same EYE_HEIGHT and ±4 cm bob amplitude/frequency.
-    // THIRD-PERSON: camera behind/above the avatar, looking at its chest. No
-    //   head-bob; instead the walk cycle (animateAvatar) drives the limbs.
-    try {
-      if (thirdPerson) {
-        // Position the avatar at the player's feet, facing where the camera
-        // looks (Vice-City style: character turns to face the view forward).
-        const pyaw = getPlayerYaw();
-        avatar.position.set(playerPos.x, 0, playerPos.z);
-        // World forward (X,Z) for this yaw = (sin yaw, -cos yaw). The avatar
-        // model faces +Z by default (no rotation = looking +Z). We need it to
-        // face the camera's forward, so rotate about Y by the angle that maps
-        // +Z → forward. That yaw-about-Y is (yaw - π/2) in our convention; but
-        // simplest: set rotation.y so the model's +Z aligns with forward.
-        // rotation.y = atan2(fwdX, fwdZ) does exactly that.
-        avatar.rotation.y = Math.atan2(Math.sin(pyaw), -Math.cos(pyaw)) + Math.PI;
-        // The "+π" flips because the model's "front" is -Z in its local frame
-        // after the limb layout; empirically the figure faces the camera's
-        // forward with this offset.
-        animateAvatar(dt, moving, speed);
-
-        // Camera: behind the player (opposite of forward) and above the feet.
-        const camTarget = new THREE.Vector3(
-          playerPos.x - dir.x * THIRD_PERSON_DIST,
-          THIRD_PERSON_HEIGHT,
-          playerPos.z - dir.z * THIRD_PERSON_DIST,
-        );
-        camera.position.copy(camTarget);
-        // Look at the avatar's upper body.
-        camera.lookAt(playerPos.x, AVATAR_LOOK_HEIGHT, playerPos.z);
-      } else {
-        // First-person. Keep playerPos.y at eye height and apply head-bob.
-        if (moving) {
-          bobPhase += dt * speed * 1.8;
-          playerPos.y = EYE_HEIGHT + Math.sin(bobPhase) * 0.04;
-        } else {
-          playerPos.y += (EYE_HEIGHT - playerPos.y) * Math.min(1, dt * 8);
-        }
-        camera.position.copy(playerPos);
-      }
-    } catch (camErr) { /* never let camera/avatar placement kill movement */ }
-
-    // `pos` alias used by HUD/minimap below — the player's current location.
-    const pos = playerPos;
-
-    // --- HUD: place name + coordinates ---
-    // Update the place name at most every PLACE_REFRESH_MS and only if the
-    // player has moved enough to be worth re-querying Nominatim.
-    try {
-      const now = performance.now();
-      const moved = lastPlacePos
-        ? Math.hypot(pos.x - lastPlacePos.x, pos.z - lastPlacePos.z)
-        : Infinity;
-      if (!placeInFlight &&
-          now - lastPlaceTime > PLACE_REFRESH_MS &&
-          moved > PLACE_REFRESH_DIST) {
-        lastPlacePos = { x: pos.x, z: pos.z };
-        const ll = scenePosToLatLon(pos);
-        refreshPlace(ll.lat, ll.lon);
-      }
-
-      const ll = scenePosToLatLon(pos);
-      hud.textContent =
-        (currentPlace ? currentPlace + '   |   ' : '') +
-        `XY: ${pos.x.toFixed(0)}, ${pos.z.toFixed(0)} m   |   ` +
-        `lat/lon: ${ll.lat.toFixed(5)}, ${ll.lon.toFixed(5)}`;
-    } catch (hudErr) {
-      // If anything in the HUD update throws, never let it kill the frame loop.
-      hud.textContent = 'XY: ' + pos.x.toFixed(0) + ', ' + pos.z.toFixed(0) + ' m';
-    }
-
-    // --- minimap: draw the player-centred top-down view ---
-    // Derive heading from the camera's world direction so it works in both
-    // pointer-lock and fallback modes. Forward in world XZ = (sin yaw, -cos yaw).
-    try {
-      const fwd = new THREE.Vector3();
-      camera.getWorldDirection(fwd);
-      const heading = Math.atan2(fwd.x, -fwd.z);  // yaw where 0 = north (-Z)
-      drawMinimap(pos.x, pos.z, heading);
-    } catch (mmErr) { /* never let minimap kill the frame loop */ }
+    const { moving, speed } = updateMovement(dt, _camFwdFlat);
+    updateCamera(dt, _camFwdFlat, moving, speed, playerYaw);
+    updateHud();
+    updateMinimap(playerYaw);
   }
 
   renderer.render(scene, camera);
 }
 
+// Fallback-mode turning: arrow keys / Q-E rotate the view when there's no
+// pointer lock. In pointer-lock mode the mouse does this and this is a no-op.
+function updateTurning(dt) {
+  if (controls.isLocked) return;
+  const turn = (keys['ArrowLeft'] || keys['KeyQ'] ? 1 : 0)
+             - (keys['ArrowRight'] || keys['KeyE'] ? 1 : 0);
+  if (turn !== 0) {
+    yaw += turn * 1.8 * dt;
+    applyFallbackLook();
+  }
+}
+
+// Desired horizontal velocity from input, applied to `playerPos` with
+// axis-separated collision resolution. Returns whether the player is moving
+// and at what speed (the camera/avatar code needs both).
+function updateMovement(dt, camFwdFlat) {
+  const speed = keys['ShiftLeft'] || keys['ShiftRight'] ? RUN_SPEED : WALK_SPEED;
+
+  const forward = (keys['KeyW'] || keys['ArrowUp']   ? 1 : 0)
+                - (keys['KeyS'] || keys['ArrowDown'] ? 1 : 0);
+  const strafe  = (keys['KeyD'] ? 1 : 0) - (keys['KeyA'] ? 1 : 0);
+
+  // Right vector = forward × up (both horizontal).
+  const right = new THREE.Vector3().crossVectors(camFwdFlat, camera.up).normalize();
+
+  _move.set(0, 0, 0);
+  _move.addScaledVector(camFwdFlat, forward * speed * dt);
+  _move.addScaledVector(right,      strafe  * speed * dt);
+
+  // Try X and Z independently so a wall on one axis doesn't kill all movement
+  // (lets you slide along building faces).
+  const tryX = playerPos.clone(); tryX.x += _move.x;
+  if (!resolveCollision(tryX)) playerPos.x = tryX.x;
+  const tryZ = playerPos.clone(); playerPos.z += _move.z;
+  if (!resolveCollision(tryZ)) playerPos.z = tryZ.z;
+
+  return { moving: (forward !== 0 || strafe !== 0), speed };
+}
+
+// Place the camera + avatar based on view mode.
+// FIRST-PERSON: camera at playerPos + eye height, with a subtle head-bob while
+//   walking (±4 cm sine; frequency scales with speed).
+// THIRD-PERSON: camera behind/above the avatar looking at its chest; no
+//   head-bob — the walk cycle (animateAvatar) drives the limbs instead.
+function updateCamera(dt, camFwdFlat, moving, speed, playerYaw) {
+  try {
+    if (thirdPerson) {
+      // Position the avatar at the player's feet, facing where the camera
+      // looks (Vice-City style: character turns to face the view forward).
+      // The avatar model's "front" is its local -Z, and world forward for
+      // `playerYaw` is (sin yaw, -cos yaw) — the rotation that aligns the
+      // model's front with that forward works out to `-playerYaw`.
+      avatar.position.set(playerPos.x, 0, playerPos.z);
+      avatar.rotation.y = -playerYaw;
+      animateAvatar(dt, moving, speed);
+
+      // Camera: behind the player (opposite of forward) and above the feet.
+      camera.position.set(
+        playerPos.x - camFwdFlat.x * THIRD_PERSON_DIST,
+        THIRD_PERSON_HEIGHT,
+        playerPos.z - camFwdFlat.z * THIRD_PERSON_DIST,
+      );
+      // Look at the avatar's upper body.
+      camera.lookAt(playerPos.x, AVATAR_LOOK_HEIGHT, playerPos.z);
+    } else {
+      // First-person. Keep playerPos.y at eye height and apply head-bob.
+      if (moving) {
+        bobPhase += dt * speed * 1.8;
+        playerPos.y = EYE_HEIGHT + Math.sin(bobPhase) * 0.04;
+      } else {
+        playerPos.y += (EYE_HEIGHT - playerPos.y) * Math.min(1, dt * 8);
+      }
+      camera.position.copy(playerPos);
+    }
+  } catch (camErr) {
+    console.warn('Camera/avatar placement error:', camErr);
+  }
+}
+
+// HUD: place name (throttled Nominatim lookup) + live coordinates.
+function updateHud() {
+  try {
+    const now = performance.now();
+    const moved = lastPlacePos
+      ? Math.hypot(playerPos.x - lastPlacePos.x, playerPos.z - lastPlacePos.z)
+      : Infinity;
+    if (!placeInFlight &&
+        now - lastPlaceTime > PLACE_REFRESH_MS &&
+        moved > PLACE_REFRESH_DIST) {
+      lastPlacePos = { x: playerPos.x, z: playerPos.z };
+      const ll = scenePosToLatLon(playerPos);
+      refreshPlace(ll.lat, ll.lon);
+    }
+
+    const ll = scenePosToLatLon(playerPos);
+    dom.hud.textContent =
+      (currentPlace ? currentPlace + '   |   ' : '') +
+      `XY: ${playerPos.x.toFixed(0)}, ${playerPos.z.toFixed(0)} m   |   ` +
+      `lat/lon: ${ll.lat.toFixed(5)}, ${ll.lon.toFixed(5)}`;
+  } catch (hudErr) {
+    // Never let the HUD kill the frame loop — fall back to bare coordinates.
+    console.warn('HUD update error:', hudErr);
+    dom.hud.textContent = 'XY: ' + playerPos.x.toFixed(0) + ', ' + playerPos.z.toFixed(0) + ' m';
+  }
+}
+
+// Minimap: draw the player-centred top-down view. The heading is the shared
+// playerYaw computed once per frame in animate().
+function updateMinimap(playerYaw) {
+  try {
+    drawMinimap(playerPos.x, playerPos.z, playerYaw);
+  } catch (mmErr) {
+    console.warn('Minimap draw error:', mmErr);
+  }
+}
+
 // -----------------------------------------------------------------------------
-// 8. Boot
+// 13. Boot
 // -----------------------------------------------------------------------------
 
 async function boot() {
   try {
-    status.textContent = 'Fetching Jodhpur from OpenStreetMap…';
-    const { buildings, roads } = await fetchOSM(msg => { status.textContent = msg; });
-    status.textContent = `Building 3D… (${buildings.length} buildings, ${roads.length} roads)`;
+    dom.status.textContent = 'Fetching Jodhpur from OpenStreetMap…';
+    const { buildings, roads } = await fetchOSM(msg => { dom.status.textContent = msg; });
+    dom.status.textContent = `Building 3D… (${buildings.length} buildings, ${roads.length} roads)`;
     const nB = buildBuildings(buildings);
     buildRoads(roads);
-    document.getElementById('crosshair').style.display = 'block';
+    dom.crosshair.style.display = 'block';
     // Build the minimap now that colliders + roadSegments are populated.
     initMinimap();
     renderMinimapBase();
-    document.getElementById('minimapWrap').hidden = false;
-    status.textContent = `Jodhpur loaded: ${nB} buildings, ${roads.length} roads`;
+    dom.minimapWrap.hidden = false;
+    dom.status.textContent = `Jodhpur loaded: ${nB} buildings, ${roads.length} roads`;
     console.log(`Loaded Jodhpur: ${nB} buildings, ${roads.length} roads.`);
     animate();
+    worldReady = true;
 
     // Seed the HUD with the spawn location's place name so the label isn't
     // empty for the first few seconds before the movement-triggered lookup
@@ -1459,7 +1508,7 @@ async function boot() {
 
     // Engagement strategy: start in fallback (drag-to-look) mode IMMEDIATELY.
     // The scene is visible and walkable the instant data finishes loading — no
-    // overlay blocking the view, no waiting on a click that may never come.
+    // overlay blocking the view, no waiting for a click that may never come.
     // Embedded webviews (ZCode's in-app browser, etc.) often can't deliver a
     // usable click or grant pointer lock, so any design that gates the scene
     // behind "click to start" strands the user on a black overlay.
@@ -1469,13 +1518,13 @@ async function boot() {
     // hide the cursor and switch to FPS mouse-look. If not, drag-to-look keeps
     // working as it already did.
     startFallback();
-    loading.hidden = true;
-    overlay.hidden = true;   // never block the scene; keep the element for the
-                             // pointerlock 'unlock' (pause) handler.
+    dom.loading.hidden = true;
+    dom.overlay.hidden = true;   // never block the scene; keep the element for
+                                 // the pointerlock 'unlock' (pause) handler.
 
     // Persistent resume handler. After Esc pauses the game, clicking the
-    // overlay (or pressing a movement key) resumes it. The same handler also
-    // attempts a pointer-lock upgrade on the first interaction.
+    // overlay resumes it. The same handler attempts a pointer-lock upgrade.
+    // (Resume-on-keypress is handled by the keydown dispatcher in section 9.)
     const onInteract = () => {
       // If paused, resume first.
       if (!active) resumeGame();
@@ -1487,19 +1536,13 @@ async function boot() {
         } catch (e) { /* stay in fallback */ }
       }
     };
-    overlay.addEventListener('click', onInteract);
+    dom.overlay.addEventListener('click', onInteract);
     addEventListener('pointerdown', onInteract);
-    addEventListener('keydown', e => {
-      // Resume on any movement/look key, but not on modifier-only presses.
-      if (!active && ['KeyW','KeyA','KeyS','KeyD','ArrowUp','ArrowDown','ArrowLeft','ArrowRight','KeyQ','KeyE'].includes(e.code)) {
-        resumeGame();
-      }
-    });
   } catch (err) {
-    loading.classList.add('error');
-    loading.textContent = 'Failed to load Jodhpur map data: ' + err.message +
+    dom.loading.classList.add('error');
+    dom.loading.textContent = 'Failed to load Jodhpur map data: ' + err.message +
       '\n\nThe Overpass API may be busy. Wait a moment and refresh.';
-    status.textContent = 'Error: ' + err.message;
+    dom.status.textContent = 'Error: ' + err.message;
     console.error(err);
   }
 }

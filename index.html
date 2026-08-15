@@ -17,7 +17,7 @@
     /* See README "Styling & overlay" for why these rules exist. */
     html, body { margin: 0; height: 100%; background: #87ceeb; overflow: hidden; font-family: system-ui, sans-serif; }
     #app { position: fixed; inset: 0; }
-    canvas { display: block; }
+    canvas { display: block; touch-action: none; }  /* touch-action: mobile drag-look without browser pan/pinch fighting it */
 
     /* CRITICAL: an explicit `display` value (we use flex on #overlay/#loading)
        overrides the HTML `hidden` attribute, so toggling .hidden=true in JS
@@ -139,6 +139,18 @@
     .dest-item:hover { background: rgba(255,255,255,.14); }
     .dest-item .kind { display: block; font-size: 10px; opacity: .55;
       text-transform: uppercase; letter-spacing: .03em; margin-top: 1px; }
+
+    /* Narrow viewports (phones): the 200px minimap (top-right) and the 220px
+       destinations panel (top-left at y:96) overlap on ~375-500px screens.
+       Shrink the minimap (CSS-downscales the 200px canvas cleanly), narrow and
+       lower the destinations panel below it, and compact the top-left buttons. */
+    @media (max-width: 640px) {
+      #minimap { width: 120px; height: 120px; }
+      #destinations { top: 170px; width: 168px; max-height: 42vh; }
+      #inputDebug { top: 52px; }
+      #viewToggle { font-size: 12px; padding: 6px 10px; }
+      #overlay .panel { margin: 0 1rem; padding: 1.2rem; }
+    }
   </style>
 </head>
 <body>
@@ -214,6 +226,6 @@
   <!-- `?v=…` defeats caching of the module across releases. Bump this when
        app.js changes and you want every user (and embedded webview) to pick
        up the new code without a manual hard-reload. -->
-  <script type="module" src="./app.js?v=2026-08-12-20"></script>
+  <script type="module" src="./app.js?v=2026-08-12-21"></script>
 </body>
 </html>

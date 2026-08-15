@@ -218,7 +218,7 @@ Press **V** (or click the **👁 button** in the top-left) to switch between fir
 
 A subtle but important correctness fix came with this: the manual `yaw`/`pitch` variables are **stale in pointer-lock mode** (PointerLockControls writes the camera quaternion directly, bypassing them). So the avatar's facing and the third-person camera offset are derived from a single `getPlayerYaw()` helper that reads yaw from the camera's world direction (`atan2(fwd.x, -fwd.z)` — the same formula the minimap already used). This makes the character's facing correct in **both** pointer-lock and drag-to-look modes.
 
-**Known limitation:** the third-person camera doesn't (yet) collide with walls, so in Jodhpur's tight lanes it can clip through a building behind you. A real fix is camera ray-collision against building AABBs; noted as a future improvement rather than tackled here.
+**Camera wall handling:** the third-person camera *pulls in front of walls* — `updateCamera` marches from the player toward the desired offset and stops at the first blocked sample, so in tight lanes the camera tucks close instead of clipping through the building behind you (which used to hide the avatar).
 
 ---
 

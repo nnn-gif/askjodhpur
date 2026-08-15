@@ -24,6 +24,7 @@
 
 import * as THREE from 'three';
 import { PointerLockControls } from 'three/addons/controls/PointerLockControls.js';
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 
 // -----------------------------------------------------------------------------
 // 0. Configuration
@@ -235,7 +236,11 @@ function isRetryable(err) {
     if (code) return TRANSIENT_STATUS.has(code);
   }
   // AbortError / fetch network failure → try the next mirror.
+  // 'returned no data' MUST be retryable: an empty (bad-cache) response from
+  // one mirror shouldn't abort the whole load when the other mirror may be
+  // fine — that was a real abort-the-entire-fetch bug.
   return m.includes('HTML error page') ||
+         m.includes('returned no data') ||
          m.includes('Failed to fetch') ||
          m.includes('Aborted') ||
          m.includes('NetworkError') ||
@@ -455,7 +460,15 @@ const colliders = [];
 const BLUE_PALETTE = [0x2b4a7a, 0x365a8c, 0x4a6fa5, 0x6b8cbf, 0xb08968, 0xc9a87c, 0xd9c2a0];
 
 function buildBuildings(buildings) {
-  const meshMat = new THREE.MeshStandardMaterial({ roughness: 0.85, metalness: 0 });
+  // One material + one MERGED mesh per palette color. Rendering 8,900
+  // buildings as individual Meshes meant ~9,000 draw calls per frame —
+  // doubled by the shadow pass — which was the dominant render cost.
+  // Merging each color's geometries keeps the visuals identical (same
+  // geometry, same palette, same lighting) while dropping to a handful of
+  // draw calls. Collision data is unaffected (stored separately below).
+  const paletteMats = BLUE_PALETTE.map(c =>
+    new THREE.MeshStandardMaterial({ color: c, roughness: 0.85, metalness: 0 }));
+  const geosByColor = BLUE_PALETTE.map(() => []);
   let built = 0;
 
   for (const b of buildings) {
@@ -490,28 +503,40 @@ function buildBuildings(buildings) {
     geo.rotateX(-Math.PI / 2);
     geo.computeVertexNormals();
 
-    const mesh = new THREE.Mesh(geo, meshMat.clone());
-    // Deterministic color from the building's OSM id.
-    mesh.material.color.setHex(BLUE_PALETTE[Math.abs(b.id) % BLUE_PALETTE.length]);
-    mesh.castShadow = true;
-    mesh.receiveShadow = true;
-    scene.add(mesh);
+    // Deterministic color bucket from the building's OSM id.
+    geosByColor[Math.abs(b.id) % BLUE_PALETTE.length].push(geo);
 
-    // Store collision data: a broad-phase AABB (expanded by player radius) and
-    // the real footprint polygon in scene XZ. The polygon is what makes
-    // collision accurate; the AABB skips the expensive point-in-polygon test
-    // for buildings that are nowhere near the player.
-    const bbox = new THREE.Box3().setFromObject(mesh);
+    // Collision data: a broad-phase AABB (expanded by player radius) and the
+    // real footprint polygon in scene XZ. The AABB comes straight from the
+    // footprint points — the extrusion's XZ extent equals the footprint's,
+    // and collision only uses X/Z (much cheaper than a per-mesh
+    // Box3.setFromObject, which traverses the full geometry).
+    let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
+    for (const p of pts) {
+      if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x;
+      if (p.y < minZ) minZ = p.y; if (p.y > maxZ) maxZ = p.y;
+    }
     colliders.push({
-      minX: bbox.min.x - PLAYER_RADIUS,
-      maxX: bbox.max.x + PLAYER_RADIUS,
-      minZ: bbox.min.z - PLAYER_RADIUS,
-      maxZ: bbox.max.z + PLAYER_RADIUS,
+      minX: minX - PLAYER_RADIUS,
+      maxX: maxX + PLAYER_RADIUS,
+      minZ: minZ - PLAYER_RADIUS,
+      maxZ: maxZ + PLAYER_RADIUS,
       // Footprint polygon in (x, z) scene coords, in the same winding as the
       // OSM ring. pointInPoly doesn't care about winding.
       poly: pts.map(p => [p.x, p.y]),
     });
     built++;
+  }
+
+  // Emit one merged mesh per color (single-geometry buckets skip the merge).
+  for (let ci = 0; ci < geosByColor.length; ci++) {
+    const list = geosByColor[ci];
+    if (!list.length) continue;
+    const merged = list.length === 1 ? list[0] : mergeGeometries(list, false);
+    const mesh = new THREE.Mesh(merged, paletteMats[ci]);
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
+    scene.add(mesh);
   }
   return built;
 }
@@ -572,10 +597,12 @@ function roadColor(tags) {
 }
 
 // Cache materials per color so roads of the same type share one material.
+// (No `roughness` here — MeshBasicMaterial doesn't have that property, and
+// passing it made THREE log a console warning per material.)
 const _roadMatCache = Object.create(null);
 function roadMaterial(color) {
   if (!_roadMatCache[color]) {
-    _roadMatCache[color] = new THREE.MeshBasicMaterial({ color, roughness: 1 });
+    _roadMatCache[color] = new THREE.MeshBasicMaterial({ color });
   }
   return _roadMatCache[color];
 }
@@ -739,6 +766,13 @@ function initMinimap() {
 // We compute the data's bounding box, scale it to fit the offscreen canvas at
 // a chosen resolution, and draw every building polygon + road segment.
 function renderMinimapBase() {
+  // Guard: with no data at all (both Overpass result sets empty) the bounds
+  // would stay ±Infinity and the canvas size becomes NaN, throwing here —
+  // inside boot's try/catch that surfaced as a misleading "Failed to load
+  // Jodhpur" error. Skip the minimap instead; MINIMAP.transform stays null
+  // and updateMinimap no-ops.
+  if (!colliders.length && !roadSegments.length) return;
+
   // World bounds covered by the data. Buildings are stored in colliders[]
   // (with poly in scene XZ); roads in roadSegments[].
   let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
@@ -1099,7 +1133,11 @@ addEventListener('keyup', e => { keys[e.code] = false; });
 controls.addEventListener('lock', () => {
   active = true;
   showInteractiveUI();
-  dom.status.textContent += '  •  mouse-look (pointer lock)';
+  // Guard: on desktop this can fire on every re-lock after an Esc pause —
+  // only note the upgrade once.
+  if (!dom.status.textContent.includes('mouse-look')) {
+    dom.status.textContent += '  •  mouse-look (pointer lock)';
+  }
 });
 controls.addEventListener('unlock', () => {
   // Esc / losing pointer lock PAUSES the game instead of stranding the user.
@@ -1107,6 +1145,16 @@ controls.addEventListener('unlock', () => {
   // `active` off so movement/HUD freeze. Clicking the overlay (or pressing any
   // movement key) resumes via resumeGame() so there's always a way back.
   if (active) {
+    // Sync the fallback yaw/pitch from the camera's CURRENT orientation.
+    // Under pointer lock the mouse wrote the camera quaternion directly while
+    // the `yaw`/`pitch` variables went stale — without this sync, the first
+    // arrow-key turn or drag after resuming would snap the camera back to a
+    // pre-lock heading. reorder() re-expresses the same orientation in the
+    // YXZ convention applyFallbackLook() uses.
+    camera.rotation.reorder('YXZ');
+    yaw = camera.rotation.y;
+    pitch = camera.rotation.x;
+
     active = false;
     dom.overlay.hidden = false;
     dom.status.textContent = 'Paused — click a landmark to jump there, or click the card / press a key to resume';
@@ -1126,15 +1174,25 @@ function resumeGame() {
 }
 
 // Reveal the interactive-mode UI pieces (shared by the pointer-lock and
-// fallback engagement paths so neither duplicates the wiring).
+// fallback engagement paths so neither duplicates the wiring). Idempotent:
+// safe to call again when pointer lock upgrades on desktop AFTER fallback
+// already started — which previously double-bound the view-toggle click and
+// made every toggle fire twice (net no-op).
 function showInteractiveUI() {
   dom.overlay.hidden = true;
   dom.hud.hidden = false;
-  if (dom.viewToggle) {
-    dom.viewToggle.hidden = false;
-    dom.viewToggle.addEventListener('click', toggleView);
-  }
+  if (dom.viewToggle) dom.viewToggle.hidden = false;
   setupInputDebug();
+}
+
+// Bind the view-toggle click ONCE (not inside showInteractiveUI, which can run
+// twice on desktop). blur() after the click so a focused button can't be
+// re-triggered by Space/Enter during normal walking.
+if (dom.viewToggle) {
+  dom.viewToggle.addEventListener('click', () => {
+    toggleView();
+    dom.viewToggle.blur();
+  });
 }
 
 // --- Fallback path (drag-to-look + arrow keys), used when no pointer lock ------
@@ -1148,15 +1206,18 @@ function startFallback() {
   // Drag with the mouse / touch to look around. Track button state so we only
   // rotate while a button is held — otherwise the cursor stays usable. The
   // `active` guard ignores drags while paused (pause-overlay background clicks
-  // now pass through to the canvas).
+  // now pass through to the canvas), and the `controls.isLocked` guard is
+  // essential on desktop: once pointer lock engages, PointerLockControls
+  // rotates the camera from raw mouse movement — applying drag-look ON TOP of
+  // it would double every rotation.
   let dragging = false;
   let lastX = 0, lastY = 0;
   const onDown = (x, y) => {
-    if (!active) return;
+    if (!active || controls.isLocked) return;
     dragging = true; lastX = x; lastY = y;
   };
   const onMove = (x, y) => {
-    if (!dragging) return;
+    if (!dragging || controls.isLocked) return;
     const dx = x - lastX, dy = y - lastY;
     lastX = x; lastY = y;
     yaw   -= dx * 0.005;            // mouse right → look right (yaw decreases)
@@ -1227,6 +1288,8 @@ function populateDestinations(landmarks) {
     }[lm.kind] || 'Landmark';
     btn.innerHTML = `${lm.name}<span class="kind">${kindLabel}</span>`;
     btn.addEventListener('click', () => {
+      // blur so Space/Enter while walking can't re-trigger the focused button.
+      btn.blur();
       // Clicking a landmark while paused (Esc) also resumes the game, so the
       // teleport takes effect — the frame loop drives camera/HUD/minimap and
       // only runs when active.
@@ -1324,10 +1387,15 @@ async function refreshPlace(lat, lon) {
 
 const clock = new THREE.Clock();
 
-// Scratch vectors reused every frame (avoids per-frame allocation churn).
+// Scratch vectors/objects reused every frame (avoids per-frame allocation
+// churn — at 60 fps, even small allocations add up to GC pauses).
 const _camFwd = new THREE.Vector3();
 const _camFwdFlat = new THREE.Vector3();
 const _move = new THREE.Vector3();
+const _right = new THREE.Vector3();
+const _tryPos = new THREE.Vector3();
+const _camProbe = new THREE.Vector3();
+const _moveResult = { moving: false, speed: 0 };
 
 function animate() {
   requestAnimationFrame(animate);
@@ -1386,20 +1454,32 @@ function updateMovement(dt, camFwdFlat) {
   const strafe  = (keys['KeyD'] ? 1 : 0) - (keys['KeyA'] ? 1 : 0);
 
   // Right vector = forward × up (both horizontal).
-  const right = new THREE.Vector3().crossVectors(camFwdFlat, camera.up).normalize();
+  _right.crossVectors(camFwdFlat, camera.up).normalize();
 
   _move.set(0, 0, 0);
   _move.addScaledVector(camFwdFlat, forward * speed * dt);
-  _move.addScaledVector(right,      strafe  * speed * dt);
+  _move.addScaledVector(_right,     strafe  * speed * dt);
 
-  // Try X and Z independently so a wall on one axis doesn't kill all movement
-  // (lets you slide along building faces).
-  const tryX = playerPos.clone(); tryX.x += _move.x;
-  if (!resolveCollision(tryX)) playerPos.x = tryX.x;
-  const tryZ = playerPos.clone(); playerPos.z += _move.z;
-  if (!resolveCollision(tryZ)) playerPos.z = tryZ.z;
+  // Sub-step the move so one large frame delta can't TUNNEL through a thin
+  // wall. The frame dt is clamped to 0.05 s and sprint speed is 14 m/s, so a
+  // throttled tab can produce ~0.7 m per frame — bigger than PLAYER_RADIUS
+  // (0.4 m), which the old single endpoint-only check could jump straight
+  // through. Each sub-step is capped below the radius. (At normal frame rates
+  // this is exactly one step — identical behavior.)
+  const dist = _move.length();
+  const steps = Math.max(1, Math.ceil(dist / (PLAYER_RADIUS * 0.9)));
+  for (let s = 0; s < steps; s++) {
+    // Try X and Z independently within each sub-step so a wall on one axis
+    // doesn't kill all movement (lets you slide along building faces).
+    _tryPos.copy(playerPos); _tryPos.x += _move.x / steps;
+    if (!resolveCollision(_tryPos)) playerPos.x = _tryPos.x;
+    _tryPos.copy(playerPos); _tryPos.z += _move.z / steps;
+    if (!resolveCollision(_tryPos)) playerPos.z = _tryPos.z;
+  }
 
-  return { moving: (forward !== 0 || strafe !== 0), speed };
+  _moveResult.moving = (forward !== 0 || strafe !== 0);
+  _moveResult.speed = speed;
+  return _moveResult;
 }
 
 // Place the camera + avatar based on view mode.
@@ -1419,11 +1499,33 @@ function updateCamera(dt, camFwdFlat, moving, speed, playerYaw) {
       avatar.rotation.y = -playerYaw;
       animateAvatar(dt, moving, speed);
 
-      // Camera: behind the player (opposite of forward) and above the feet.
+      // Camera: behind the player and above the feet — but PULLED IN FRONT OF
+      // WALLS. In Jodhpur's tight lanes the naive fixed offset regularly put
+      // the camera inside the building behind you (near plane clipped through
+      // it, hiding the avatar). We march from the player toward the desired
+      // position and stop at the first blocked sample, placing the camera at
+      // the last free one. Buildings are full-height extrusions, so the 2D
+      // footprint test is valid at camera height.
+      const desiredX = playerPos.x - camFwdFlat.x * THIRD_PERSON_DIST;
+      const desiredZ = playerPos.z - camFwdFlat.z * THIRD_PERSON_DIST;
+      let camT = 1;   // fraction along player→desired
+      const PROBES = 8;
+      for (let i = 1; i <= PROBES; i++) {
+        const t = i / PROBES;
+        _camProbe.set(
+          playerPos.x + (desiredX - playerPos.x) * t,
+          0,
+          playerPos.z + (desiredZ - playerPos.z) * t,
+        );
+        if (resolveCollision(_camProbe)) {
+          camT = (i - 1) / PROBES;
+          break;
+        }
+      }
       camera.position.set(
-        playerPos.x - camFwdFlat.x * THIRD_PERSON_DIST,
+        playerPos.x + (desiredX - playerPos.x) * camT,
         THIRD_PERSON_HEIGHT,
-        playerPos.z - camFwdFlat.z * THIRD_PERSON_DIST,
+        playerPos.z + (desiredZ - playerPos.z) * camT,
       );
       // Look at the avatar's upper body.
       camera.lookAt(playerPos.x, AVATAR_LOOK_HEIGHT, playerPos.z);
@@ -1470,8 +1572,10 @@ function updateHud() {
 }
 
 // Minimap: draw the player-centred top-down view. The heading is the shared
-// playerYaw computed once per frame in animate().
+// playerYaw computed once per frame in animate(). No-ops if the static base
+// map wasn't built (empty data set) instead of throwing every frame.
 function updateMinimap(playerYaw) {
+  if (!MINIMAP.transform) return;
   try {
     drawMinimap(playerPos.x, playerPos.z, playerYaw);
   } catch (mmErr) {

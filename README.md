@@ -202,6 +202,14 @@ Two things make it cheap and readable:
 
 World→minimap geometry: scene `+X` (east) → right, scene `+Z` (north) → up (the Z axis is flipped because canvas Y grows downward). The player's heading comes from the camera's world direction via `atan2(fwd.x, -fwd.z)`, which works in both pointer-lock and drag-to-look modes. The per-frame minimap draw is wrapped in a try/catch so a drawing failure can never stall the movement loop.
 
+## Orientation — "where am I?"
+
+Identifying your location is unusually hard in Jodhpur's old city: only ~3% of its roads are named in OpenStreetMap, so a reverse-geocode alone often reports a street hundreds of meters away. The app therefore answers "where am I?" three ways, all from data it already has:
+
+1. **HUD second line — nearest named road + nearest landmark with live distances** (e.g. `🛣 Layakam Mohalla · on it · 📍 Moti Mahal · 322 m`), recomputed at most once per second against the ~450 named road segments and the landmark set. This is how people actually describe location in Indian cities — "near Sardar Market".
+2. **Beacons + floating name labels in the 3D world.** Each landmark gets a tall translucent pillar (gold for gates, coral for other places) with its name floating at 44 m — visible from a distance, fading with fog, so you can see a known place and walk toward it.
+3. **Minimap labels.** Named roads are drawn along their direction on the minimap, and landmarks appear as colour-coded dots with names.
+
 ---
 
 ## Character / third-person view (Vice-City style)

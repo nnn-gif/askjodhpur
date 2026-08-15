@@ -560,8 +560,11 @@ function buildBuildings(buildings) {
 // the player can walk on them, which is the point.
 //
 // We also keep a flat list of road segments in scene coords (`roadSegments`)
-// for the minimap to draw.
+// for the minimap to draw, and a NAMED subset (`namedRoadSegments`) so the
+// HUD can show the nearest named street — only ~3% of Jodhpur's roads are
+// named in OSM, and those names are the anchors people actually know.
 const roadSegments = [];
+const namedRoadSegments = [];   // { name, x1, z1, x2, z2 }
 
 // Per-road-type rendering config: [width in meters, color].
 const ROAD_STYLE = {
@@ -619,6 +622,7 @@ function buildRoads(roads) {
     const width = roadWidth(tags);
     const half = width / 2;
     const color = roadColor(tags);
+    const roadName = tags['name:en'] || tags.name || '';
     let bucket = byColor[color];
     if (!bucket) {
       bucket = { verts: [], idx: [] };
@@ -629,6 +633,7 @@ function buildRoads(roads) {
       const [x1, z1] = lonLatToXY(g[i].lon, g[i].lat);
       const [x2, z2] = lonLatToXY(g[i+1].lon, g[i+1].lat);
       roadSegments.push([x1, z1, x2, z2]);
+      if (roadName) namedRoadSegments.push({ name: roadName, x1, z1, x2, z2 });
 
       // Direction of this segment and its perpendicular (in XZ).
       let dx = x2 - x1, dz = z2 - z1;
@@ -834,6 +839,28 @@ function renderMinimapBase() {
     for (let i = 1; i < poly.length; i++) bctx.lineTo(wx(poly[i][0]), wz(poly[i][1]));
     bctx.closePath();
     bctx.fill();
+  }
+
+  // Label the NAMED roads along their direction — street names on the map are
+  // the strongest "I know this place" anchor. Only long-enough segments get a
+  // label to avoid clutter.
+  for (const s of namedRoadSegments) {
+    const px1 = wx(s.x1), pz1 = wz(s.z1), px2 = wx(s.x2), pz2 = wz(s.z2);
+    if (Math.hypot(px2 - px1, pz2 - pz1) < 60) continue;   // too short to label
+    const mx = (px1 + px2) / 2, my = (pz1 + pz2) / 2;
+    let ang = Math.atan2(pz2 - pz1, px2 - px1);
+    if (ang > Math.PI / 2 || ang < -Math.PI / 2) ang += Math.PI;  // keep readable
+    bctx.save();
+    bctx.translate(mx, my);
+    bctx.rotate(ang);
+    bctx.font = 'italic 11px system-ui, sans-serif';
+    bctx.textAlign = 'center';
+    bctx.lineWidth = 3;
+    bctx.strokeStyle = 'rgba(0,0,0,.6)';
+    bctx.strokeText(s.name, 0, -3);
+    bctx.fillStyle = 'rgba(255,255,255,.9)';
+    bctx.fillText(s.name, 0, -3);
+    bctx.restore();
   }
 
   // Stash the world→pixel transform params for the per-frame draw.
@@ -1264,16 +1291,133 @@ function updateInputDebug() {
 }
 
 // -----------------------------------------------------------------------------
-// 10. Destinations panel (teleport to gates + landmarks)
+// 10. Destinations & orientation (teleport, nearest places, landmark beacons)
 // -----------------------------------------------------------------------------
 //
 // A collapsible list of Jodhpur's historic gates and major landmarks, fetched
 // from OpenStreetMap (section 2's fetchLandmarks). Click a name and the player
-// teleports there instantly — useful for getting oriented in a dense city
-// where walking between landmarks takes a while.
+// teleports there instantly.
+//
+// The same landmark data drives ORIENTATION — answering "where am I?" three
+// ways, because that's hard in a city where only ~3% of roads are named:
+//   - the HUD shows the NEAREST NAMED ROAD + NEAREST LANDMARK with distances
+//     (how people actually describe location: "near Sardar Market"),
+//   - every landmark gets a tall beacon + floating name label in the 3D world
+//     so you can see and walk toward known places,
+//   - the minimap labels named roads and marks landmark positions.
 
-function populateDestinations(landmarks) {
+let landmarks = [];   // { name, kind, x, z, lat, lon } — set once fetched
+
+// Distance from point (px,pz) to segment (x1,z1)-(x2,z2), for nearest-road.
+function distPointToSegment(px, pz, x1, z1, x2, z2) {
+  const dx = x2 - x1, dz = z2 - z1;
+  const L2 = dx * dx + dz * dz;
+  if (L2 === 0) return Math.hypot(px - x1, pz - z1);
+  let t = ((px - x1) * dx + (pz - z1) * dz) / L2;
+  t = Math.max(0, Math.min(1, t));
+  return Math.hypot(px - (x1 + t * dx), pz - (z1 + t * dz));
+}
+
+// Nearest-places state, recomputed at most once per second (a few hundred
+// segment distance tests — trivial, but no reason to do them 60×/s).
+let _nearestRoadTxt = '';
+let _nearestLmTxt = '';
+let _lastNearestTime = 0;
+function updateNearest() {
+  const now = performance.now();
+  if (now - _lastNearestTime < 1000) return;
+  _lastNearestTime = now;
+
+  let bestRoad = null, bestRoadD = Infinity;
+  for (const s of namedRoadSegments) {
+    const d = distPointToSegment(playerPos.x, playerPos.z, s.x1, s.z1, s.x2, s.z2);
+    if (d < bestRoadD) { bestRoadD = d; bestRoad = s; }
+  }
+  _nearestRoadTxt = bestRoad
+    ? `🛣 ${bestRoad.name} · ${bestRoadD < 8 ? 'on it' : Math.round(bestRoadD) + ' m'}`
+    : '';
+
+  let bestLm = null, bestLmD = Infinity;
+  for (const l of landmarks) {
+    const d = Math.hypot(l.x - playerPos.x, l.z - playerPos.z);
+    if (d < bestLmD) { bestLmD = d; bestLm = l; }
+  }
+  _nearestLmTxt = bestLm ? `📍 ${bestLm.name} · ${Math.round(bestLmD)} m` : '';
+}
+
+// A canvas-texture sprite with the given text — used for floating landmark
+// name labels. Cheap, crisp at distance, and fades with fog like the world.
+function makeLabelSprite(text) {
+  const c = document.createElement('canvas');
+  c.width = 256; c.height = 64;
+  const g = c.getContext('2d');
+  g.font = 'bold 30px system-ui, sans-serif';
+  g.textAlign = 'center';
+  g.textBaseline = 'middle';
+  g.lineWidth = 6;
+  g.strokeStyle = 'rgba(0,0,0,.8)';
+  g.strokeText(text, 128, 32);
+  g.fillStyle = '#fff';
+  g.fillText(text, 128, 32);
+  const tex = new THREE.CanvasTexture(c);
+  const sprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, transparent: true }));
+  sprite.scale.set(24, 6, 1);   // world meters — readable from a distance
+  return sprite;
+}
+
+// Tall semi-transparent beacon + name label over each landmark, so known
+// places are visible from anywhere in the city and you can orient by them.
+function buildLandmarkBeacons() {
+  const gateColor = 0xffd54a;      // gold for gates
+  const placeColor = 0xff8a65;     // coral for forts/attractions/memorials
+  for (const lm of landmarks) {
+    const color = /^(gate|city_gate)$/i.test(lm.kind) ? gateColor : placeColor;
+    const beacon = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.6, 0.6, 40, 8, 1, true),
+      new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.3, depthWrite: false }),
+    );
+    beacon.position.set(lm.x, 20, lm.z);
+    scene.add(beacon);
+
+    const label = makeLabelSprite(lm.name);
+    label.position.set(lm.x, 44, lm.z);
+    scene.add(label);
+  }
+}
+
+// Draw landmark dots + names directly onto the minimap's offscreen BASE
+// canvas (persistent — the per-frame blit picks them up automatically).
+// Called once, after the landmarks arrive.
+function drawLandmarksOnMinimap() {
+  if (!MINIMAP.transform) return;
+  const { minX, maxZ, PX_PER_M } = MINIMAP.transform;
+  const bctx = MINIMAP.baseCtx;
+  const wx = x => (x - minX) * PX_PER_M;
+  const wz = z => (maxZ - z) * PX_PER_M;
+  for (const lm of landmarks) {
+    const px = wx(lm.x), pz = wz(lm.z);
+    const isGate = /^(gate|city_gate)$/i.test(lm.kind);
+    bctx.fillStyle = isGate ? '#ffd54a' : '#ff8a65';
+    bctx.beginPath();
+    bctx.arc(px, pz, 5, 0, Math.PI * 2);
+    bctx.fill();
+    bctx.strokeStyle = 'rgba(0,0,0,.6)';
+    bctx.lineWidth = 1.5;
+    bctx.stroke();
+    bctx.font = 'bold 11px system-ui, sans-serif';
+    bctx.textAlign = 'center';
+    bctx.lineWidth = 3;
+    bctx.strokeStyle = 'rgba(0,0,0,.7)';
+    bctx.strokeText(lm.name, px, pz - 9);
+    bctx.fillStyle = isGate ? '#ffe9a8' : '#ffd9cc';
+    bctx.fillText(lm.name, px, pz - 9);
+  }
+}
+
+function populateDestinations(list) {
   if (!dom.destinations || !dom.destList) return;
+  // Store for nearest-landmark orientation + beacons/minimap markers.
+  landmarks = list;
   if (!landmarks.length) { dom.destinations.hidden = true; return; }
 
   dom.destList.innerHTML = '';
@@ -1424,6 +1568,7 @@ function animate() {
 
     const { moving, speed } = updateMovement(dt, _camFwdFlat);
     updateCamera(dt, _camFwdFlat, moving, speed, playerYaw);
+    updateNearest();       // nearest named road + landmark (throttled 1 s)
     updateHud();
     updateMinimap(playerYaw);
   }
@@ -1560,10 +1705,15 @@ function updateHud() {
     }
 
     const ll = scenePosToLatLon(playerPos);
+    // Two lines: Nominatim place + coordinates, then nearest named road and
+    // nearest landmark with distances (the useful "where am I" anchors in a
+    // city where most streets are unnamed in OSM). #hud uses pre-line.
+    const line2 = [_nearestRoadTxt, _nearestLmTxt].filter(Boolean).join('   ·   ');
     dom.hud.textContent =
       (currentPlace ? currentPlace + '   |   ' : '') +
       `XY: ${playerPos.x.toFixed(0)}, ${playerPos.z.toFixed(0)} m   |   ` +
-      `lat/lon: ${ll.lat.toFixed(5)}, ${ll.lon.toFixed(5)}`;
+      `lat/lon: ${ll.lat.toFixed(5)}, ${ll.lon.toFixed(5)}` +
+      (line2 ? '\n' + line2 : '');
   } catch (hudErr) {
     // Never let the HUD kill the frame loop — fall back to bare coordinates.
     console.warn('HUD update error:', hudErr);
@@ -1612,9 +1762,14 @@ async function boot() {
     // Fetch gates + landmarks for the destinations panel. Run AFTER the scene
     // is live so it can't delay the initial render; it's a small, separate
     // query and any failure is non-fatal (the panel just stays hidden).
-    fetchLandmarks().then(landmarks => {
-      populateDestinations(landmarks);
+    // Once fetched, the same data drives orientation: beacons + name labels
+    // in the 3D world, dots + names on the minimap, and the HUD's
+    // nearest-landmark line.
+    fetchLandmarks().then(list => {
+      populateDestinations(list);
       if (landmarks.length) {
+        buildLandmarkBeacons();
+        drawLandmarksOnMinimap();
         console.log(`Loaded ${landmarks.length} destinations.`);
       }
     }).catch(err => console.warn('Landmarks fetch failed:', err.message));

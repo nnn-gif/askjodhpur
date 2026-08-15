@@ -136,9 +136,9 @@ The origin is set to the heart of Jodhpur's old city `(26.298°N, 73.022°E)`, s
 3. `THREE.ExtrudeGeometry` lifts the shape by the building's height into a solid block.
 4. `rotateX(-90°)` stands the block upright (the extrude axis is +Z in shape space; we want it to be +Y in world space).
 
-**Height:** OSM's `building:levels` tag gives floor count when present (multiplied by 3.2 m/level). Failing that, a direct `height` tag in meters. Failing that, a 6 m default. This is the same heuristic [OSMBuildings](https://osmbuildings.org/) and Cesium's OSM buildings use.
+**Height:** OSM's `building:levels` tag gives floor count when present (multiplied by 3.2 m/level). Failing that, a direct `height` tag in meters. For the ~99.9% of Jodhpur buildings with neither, a **varied deterministic fallback** (hashed from the OSM id, so it's stable per building): mostly ~2 storeys, often 3, occasionally 4–5 — weighted like the real old city. A single flat default made the skyline an unreadable slab; varied heights read as a real town even though they're invented.
 
-**Color:** A palette leaning into Jodhpur's "Blue City" identity (the old city's houses are famously indigo), with a few warm sandstone tones. Each building's color is picked deterministically from its OSM id (`id % palette.length`) so a building is the same color every reload — not flickering randomly.
+**Color:** A palette leaning into Jodhpur's "Blue City" identity — indigo blues dominant, sun-bleached sandstone and terracotta accents — with per-building hue/lightness **jitter** (also id-hashed) so neighbouring walls of the same family read as separately weathered. Colors are baked as a **vertex-color attribute** and the whole city merges into **one mesh** with a single white vertex-color material: one draw call for ~8,900 buildings, with continuous color variation that flat per-material palettes can't do.
 
 ### 5. Walking controls: **PointerLockControls + WASD, with a no-lock fallback**
 
@@ -229,6 +229,20 @@ Press **V** (or click the **👁 button** in the top-left) to cycle views: **fir
 A subtle but important correctness fix came with this: the manual `yaw`/`pitch` variables are **stale in pointer-lock mode** (PointerLockControls writes the camera quaternion directly, bypassing them). So the avatar's facing and the third-person camera offset are derived from a single `getPlayerYaw()` helper that reads yaw from the camera's world direction (`atan2(fwd.x, -fwd.z)` — the same formula the minimap already used). This makes the character's facing correct in **both** pointer-lock and drag-to-look modes.
 
 **Camera wall handling:** the third-person camera *pulls in front of walls* — `updateCamera` marches from the player toward the desired offset and stops at the first blocked sample, so in tight lanes the camera tucks close instead of clipping through the building behind you (which used to hide the avatar).
+
+---
+
+## Sense of place — golden-hour Jodhpur
+
+Geometry alone doesn't make a place feel like a place; light, color variation, and ground truth do. This pass (all procedural, zero new assets) transformed the scene from "flat blue boxes under noon light" into late-afternoon Rajasthan:
+
+- **Varied building heights** — weighted deterministic fallback (mostly 2 storeys, often 3, sometimes 4–5) instead of one flat 6 m default. The single biggest "this is fake" signal was the uniform skyline slab.
+- **Per-building color via vertex colors** — indigo/sandstone families with hue + lightness jitter, baked per-vertex and merged into ONE mesh (one draw call for the whole city, replacing the earlier 7-color-bucket merge). Neighbouring walls read as separately weathered.
+- **Golden-hour lighting** — a 16×256 canvas gradient sky (blue zenith → warm horizon glow) as `scene.background`, a warm lower sun for long shadows, warm hemisphere ground-bounce, and fog matched to the horizon tone so the data's edge dissolves into haze.
+- **Procedural sand ground** — a 256 px canvas of grain + faint patches, tiled 180× across the 4 km plane. Kills the flat-paint look.
+- **~450 roadside trees** — low-poly trunk + canopy, deterministically scattered along road segments (collision-checked so they never spawn inside footprints), merged into one vertex-color mesh. The only green in the scene, and it changes everything.
+
+Everything is deterministic (hash of the OSM id / segment index), so the city looks identical on every load. One real geometry gotcha surfaced here: `mergeGeometries` returns **null** for mixed indexed/non-indexed input — the tree trunk (`CylinderGeometry`, indexed) had to be `toNonIndexed()`-ed before merging with the icosahedron canopy.
 
 ---
 

@@ -30,8 +30,8 @@ import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 // 0. Configuration
 // -----------------------------------------------------------------------------
 // All tuning scalars live here so there's one place to look. Feature-specific
-// lookup tables (BLUE_PALETTE, ROAD_STYLE) stay co-located with their builders
-// in section 4, where they're most readable.
+// lookup tables (CITY_BLUES/CITY_WARMS, ROAD_STYLE) stay co-located with
+// their builders in section 4, where they're most readable.
 
 // --- Geographic --------------------------------------------------------------
 
@@ -367,12 +367,30 @@ async function fetchLandmarks() {
 // -----------------------------------------------------------------------------
 
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(0x87ceeb);      // sky blue
-scene.fog = new THREE.Fog(0x87ceeb, 120, 450);     // haze hides the edge of the
-                                                    // data and adds depth. The far
-                                                    // value must be smaller than
-                                                    // the data radius (~3 km) so
-                                                    // we never see the void.
+
+// --- Sky: vertical gradient (golden-hour Rajasthan) --------------------------
+// A tiny 16×256 canvas stretched as the background: deeper blue zenith fading
+// through pale haze into a warm horizon glow. Cheap (one texture, no geometry)
+// and instantly sets the time of day. The fog color below matches the horizon
+// so distant buildings fade into the same warm haze.
+function makeSkyTexture() {
+  const c = document.createElement('canvas');
+  c.width = 16; c.height = 256;
+  const g = c.getContext('2d');
+  const grad = g.createLinearGradient(0, 0, 0, 256);
+  grad.addColorStop(0.00, '#6fa8dc');   // zenith
+  grad.addColorStop(0.45, '#b8d4e8');   // mid haze
+  grad.addColorStop(0.72, '#eed9b3');   // warm transition
+  grad.addColorStop(0.90, '#f0c891');   // horizon glow
+  grad.addColorStop(1.00, '#e6b27e');   // low horizon
+  g.fillStyle = grad;
+  g.fillRect(0, 0, 16, 256);
+  return new THREE.CanvasTexture(c);
+}
+scene.background = makeSkyTexture();
+// Fog matched to the warm horizon tone so the far edge of the data dissolves
+// into haze instead of a hard cut.
+scene.fog = new THREE.Fog(0xeed3a6, 120, 450);
 
 const camera = new THREE.PerspectiveCamera(
   72,                                               // FOV — slightly wide, feels
@@ -393,14 +411,16 @@ window.addEventListener('resize', () => {
   renderer.setSize(window.innerWidth, window.innerHeight);
 });
 
-// --- Lighting ---------------------------------------------------------------
-// A hemisphere light gives soft sky-vs-ground ambient fill (cheap, looks
-// natural). A single directional light stands in for the sun and casts shadows.
-const hemi = new THREE.HemisphereLight(0xbfd9ff, 0x6b5a3a, 0.9);
+// --- Lighting: late-afternoon desert sun --------------------------------------
+// A hemisphere light gives soft sky-vs-ground ambient fill; a single warm,
+// fairly LOW directional light stands in for the sun (golden hour — long
+// shadows, warm walls). Warm ground bounce keeps shadowed faces from going
+// cold blue.
+const hemi = new THREE.HemisphereLight(0xcfe0f5, 0x9a7b55, 0.75);
 scene.add(hemi);
 
-const sun = new THREE.DirectionalLight(0xfff2d8, 1.1);
-sun.position.set(80, 140, 40);
+const sun = new THREE.DirectionalLight(0xffd9a0, 1.25);
+sun.position.set(120, 85, -60);       // lower angle → longer shadows
 sun.castShadow = true;
 sun.shadow.mapSize.set(2048, 2048);
 // Keep the shadow camera framed on the area around the player's start so the
@@ -410,14 +430,40 @@ sun.shadow.camera.right = 150;
 sun.shadow.camera.top = 150;
 sun.shadow.camera.bottom = -150;
 sun.shadow.camera.near = 1;
-sun.shadow.camera.far = 400;
+sun.shadow.camera.far = 500;
 scene.add(sun);
 
-// --- Ground plane -------------------------------------------------------------
-// A large plane represents the ground, tinted a warm sandy color to evoke
-// Jodhpur's desert setting (the Sun City / Blue City).
+// --- Ground plane: procedural sand texture ------------------------------------
+// A 256px canvas of sandy grain + faint patches, tiled ~180× across the 4 km
+// plane (~22 m per tile). One texture kills the "flat paint" look of a solid
+// color while staying perfectly seamless by construction (noise only).
+function makeGroundTexture() {
+  const c = document.createElement('canvas');
+  c.width = c.height = 256;
+  const g = c.getContext('2d');
+  g.fillStyle = '#c9b08a';                 // base sand (same family as before)
+  g.fillRect(0, 0, 256, 256);
+  // Fine grain: thousands of 1–3 px specks, darker + lighter.
+  for (let i = 0; i < 2600; i++) {
+    g.fillStyle = Math.random() < 0.5 ? 'rgba(120,96,66,0.10)' : 'rgba(240,224,190,0.10)';
+    const s = 1 + Math.random() * 2.5;
+    g.fillRect(Math.random() * 256, Math.random() * 256, s, s);
+  }
+  // Faint larger patches so the ground isn't uniformly noisy.
+  for (let i = 0; i < 22; i++) {
+    g.fillStyle = Math.random() < 0.5 ? 'rgba(140,110,80,0.05)' : 'rgba(235,220,190,0.05)';
+    g.beginPath();
+    g.arc(Math.random() * 256, Math.random() * 256, 18 + Math.random() * 36, 0, Math.PI * 2);
+    g.fill();
+  }
+  const tex = new THREE.CanvasTexture(c);
+  tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+  tex.repeat.set(180, 180);
+  return tex;
+}
+
 const groundGeo = new THREE.PlaneGeometry(4000, 4000);
-const groundMat = new THREE.MeshStandardMaterial({ color: 0xc9b08a, roughness: 1 });
+const groundMat = new THREE.MeshStandardMaterial({ map: makeGroundTexture(), roughness: 1 });
 const ground = new THREE.Mesh(groundGeo, groundMat);
 ground.rotation.x = -Math.PI / 2;   // PlaneGeometry is in the XY plane; rotate
                                      // it to lie flat on the XZ ground plane.
@@ -439,15 +485,32 @@ scene.add(ground);
 // otherwise we fall back to a default. This is the standard heuristic used by
 // OSMBuildings, Cesium, and other OSM-3D viewers.
 
-const DEFAULT_BUILDING_HEIGHT = 6;     // ~2 storeys if no data
 const METERS_PER_LEVEL = 3.2;
 
-function buildingHeight(tags) {
+// Deterministic pseudo-random from an integer id (mulberry-style bit mix).
+// Same id → same value on every load, so building heights/colors are stable.
+function hashId(id) {
+  let h = Math.abs(id | 0);
+  h = (h ^ 61) ^ (h >>> 16);
+  h = h + (h << 3);
+  h = h ^ (h >>> 4);
+  h = Math.imul(h, 0x27d4eb2d);
+  h = h ^ (h >>> 15);
+  return (h >>> 0) / 4294967296;   // 0..1
+}
+
+function buildingHeight(tags, id) {
   const levels = parseFloat(tags['building:levels']);
   if (!isNaN(levels) && levels > 0) return levels * METERS_PER_LEVEL;
   const h = parseFloat(tags['height']); // some tags give meters directly
   if (!isNaN(h) && h > 0) return h;
-  return DEFAULT_BUILDING_HEIGHT;
+  // The invented fallback — VARIED, deterministic per building, weighted like
+  // the real old city: mostly 2 storeys, often 3, occasionally 4–5. A single
+  // flat default made the skyline an unreadable slab.
+  const r = hashId(id);
+  if (r < 0.45) return 5.5 + r * 2.2;          // ≈5.5–7.5 m (2 storeys)
+  if (r < 0.80) return 8.0 + (r - 0.45) * 4.5; // ≈8.0–9.6 m (3 storeys)
+  return 10.0 + (r - 0.80) * 18.0;             // 10–13.6 m (4–5 storeys)
 }
 
 // Collision data. For each building we store:
@@ -462,21 +525,34 @@ function buildingHeight(tags) {
 // the collision match what you see. (See section 5 for the tests.)
 const colliders = [];
 
-// A palette leaning into Jodhpur's famous "Blue City" old-town colors, with a
-// few warm tones mixed in. We pick per-building deterministically from the OSM
-// id so the same building is always the same color on reload.
-const BLUE_PALETTE = [0x2b4a7a, 0x365a8c, 0x4a6fa5, 0x6b8cbf, 0xb08968, 0xc9a87c, 0xd9c2a0];
+// A palette leaning into Jodhpur's identity: the old city's famous indigo
+// blues dominate, with sun-bleached sandstone and a touch of terracotta
+// mixed in. Each building picks a family+shade and gets a subtle lightness
+// jitter — all deterministic from its OSM id so the city looks the same on
+// every reload. Delivered as VERTEX COLORS on one merged mesh (below).
+const CITY_BLUES = [0x2b4a7a, 0x33568e, 0x3f66a5, 0x5278b8, 0x6f93c9];
+const CITY_WARMS = [0xc9a87c, 0xd9c2a0, 0xb08968, 0xc27e5a];
+
+function buildingColor(id) {
+  const pick = hashId(id * 7 + 13);
+  const shade = hashId(id * 31 + 5);
+  const jitter = hashId(id * 17 + 29);
+  const hex = pick < 0.62
+    ? CITY_BLUES[Math.floor(shade * CITY_BLUES.length)]
+    : CITY_WARMS[Math.floor(shade * CITY_WARMS.length)];
+  // offsetHSL(h, s, l): tiny hue/sat wander + ±6% lightness — enough that
+  // neighbouring walls of the "same" color read as separately weathered.
+  return new THREE.Color(hex).offsetHSL((jitter - 0.5) * 0.02, (jitter - 0.5) * 0.08, (jitter - 0.5) * 0.12);
+}
 
 function buildBuildings(buildings) {
-  // One material + one MERGED mesh per palette color. Rendering 8,900
-  // buildings as individual Meshes meant ~9,000 draw calls per frame —
-  // doubled by the shadow pass — which was the dominant render cost.
-  // Merging each color's geometries keeps the visuals identical (same
-  // geometry, same palette, same lighting) while dropping to a handful of
-  // draw calls. Collision data is unaffected (stored separately below).
-  const paletteMats = BLUE_PALETTE.map(c =>
-    new THREE.MeshStandardMaterial({ color: c, roughness: 0.85, metalness: 0 }));
-  const geosByColor = BLUE_PALETTE.map(() => []);
+  // ALL buildings merge into ONE mesh whose per-building colors come from a
+  // vertex-color attribute (see buildingColor). That's one draw call for the
+  // entire city (plus one for the shadow pass) — down from ~9,000 originally
+  // and 7 after the first merge pass — while allowing continuous color
+  // variation that per-material palettes can't. Collision data is stored
+  // separately below and is unaffected.
+  const allGeos = [];
   let built = 0;
 
   for (const b of buildings) {
@@ -499,7 +575,7 @@ function buildBuildings(buildings) {
     try { shape = new THREE.Shape(pts); }
     catch (e) { continue; }                // degenerate polygon; skip
 
-    const height = buildingHeight(b.tags || {});
+    const height = buildingHeight(b.tags || {}, b.id);
     const geo = new THREE.ExtrudeGeometry(shape, {
       depth: height,
       bevelEnabled: false,
@@ -511,8 +587,15 @@ function buildBuildings(buildings) {
     geo.rotateX(-Math.PI / 2);
     geo.computeVertexNormals();
 
-    // Deterministic color bucket from the building's OSM id.
-    geosByColor[Math.abs(b.id) % BLUE_PALETTE.length].push(geo);
+    // Bake this building's color into a vertex-color attribute.
+    const col = buildingColor(b.id);
+    const vcount = geo.attributes.position.count;
+    const colors = new Float32Array(vcount * 3);
+    for (let i = 0; i < vcount; i++) {
+      colors[i * 3] = col.r; colors[i * 3 + 1] = col.g; colors[i * 3 + 2] = col.b;
+    }
+    geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+    allGeos.push(geo);
 
     // Collision data: a broad-phase AABB (expanded by player radius) and the
     // real footprint polygon in scene XZ. The AABB comes straight from the
@@ -536,12 +619,12 @@ function buildBuildings(buildings) {
     built++;
   }
 
-  // Emit one merged mesh per color (single-geometry buckets skip the merge).
-  for (let ci = 0; ci < geosByColor.length; ci++) {
-    const list = geosByColor[ci];
-    if (!list.length) continue;
-    const merged = list.length === 1 ? list[0] : mergeGeometries(list, false);
-    const mesh = new THREE.Mesh(merged, paletteMats[ci]);
+  // One merged mesh; the white base material lets vertex colors show through.
+  if (allGeos.length) {
+    const merged = allGeos.length === 1 ? allGeos[0] : mergeGeometries(allGeos, false);
+    const mesh = new THREE.Mesh(merged, new THREE.MeshStandardMaterial({
+      vertexColors: true, roughness: 0.85, metalness: 0,
+    }));
     mesh.castShadow = true;
     mesh.receiveShadow = true;
     scene.add(mesh);
@@ -674,6 +757,79 @@ function buildRoads(roads) {
     geo.computeBoundingSphere();   // helps frustum culling
     scene.add(new THREE.Mesh(geo, roadMaterial(parseInt(color))));
   }
+}
+
+// --- Trees: greenery along the roads -------------------------------------------
+// The scene had zero green, which made the blue/sand palette monotonous and
+// artificial. We scatter a few hundred low-poly trees (trunk + canopy) along
+// road segments, deterministically (hash-based, stable per load), offset to
+// the roadside and rejected if they'd land inside a building footprint. All
+// trees merge into ONE vertex-colored mesh — one draw call, no per-frame
+// cost, purely decorative (no collision).
+function buildTrees() {
+  // Base tree geometry: trunk cylinder + low-poly canopy, vertex-colored.
+  // toNonIndexed() on the trunk is REQUIRED before merging: CylinderGeometry
+  // is indexed while IcosahedronGeometry is not, and mergeGeometries returns
+  // null for mixed input (which then blew up on .clone()).
+  const trunk = new THREE.CylinderGeometry(0.18, 0.28, 2.4, 5).toNonIndexed();
+  trunk.translate(0, 1.2, 0);
+  const canopy = new THREE.IcosahedronGeometry(1.6, 0);
+  canopy.translate(0, 3.2, 0);
+  const paint = (geo, hex) => {
+    const col = new THREE.Color(hex);
+    const n = geo.attributes.position.count;
+    const arr = new Float32Array(n * 3);
+    for (let i = 0; i < n; i++) { arr[i*3] = col.r; arr[i*3+1] = col.g; arr[i*3+2] = col.b; }
+    geo.setAttribute('color', new THREE.BufferAttribute(arr, 3));
+    return geo;
+  };
+  paint(trunk, 0x6b4a2f);      // brown trunk
+  paint(canopy, 0x3e6b35);     // dusty green canopy
+  const treeTemplate = mergeGeometries([trunk, canopy], false);
+
+  // Over-sample: the old city is dense, so the collision check rejects a
+  // large share of roadside spots. Starting from ~1200 candidates lands
+  // roughly 300–400 actual trees.
+  const TARGET = 1200;
+  const total = roadSegments.length;
+  if (!total) return 0;
+  const chance = Math.min(1, TARGET / total);
+
+  const parts = [];
+  const _probe = new THREE.Vector3();
+  for (let i = 0; i < total && parts.length < TARGET + 100; i++) {
+    if (hashId(i * 131 + 17) > chance) continue;   // deterministic thinning
+    const seg = roadSegments[i];
+    const dx = seg[2] - seg[0], dz = seg[3] - seg[1];
+    const len = Math.hypot(dx, dz);
+    if (len < 12) continue;                        // skip tiny segments
+    // Random point along the segment, offset to one side of the road.
+    const t = hashId(i * 29 + 3);
+    const side = hashId(i * 53 + 11) < 0.5 ? -1 : 1;
+    const px = (-dz / len) * side * 3.2;           // perpendicular, ~3 m off-centre
+    const pz = ( dx / len) * side * 3.2;
+    const x = seg[0] + dx * t + px;
+    const z = seg[1] + dz * t + pz;
+    // Reject spots inside/near buildings (reuse the player collision test).
+    _probe.set(x, 0, z);
+    if (resolveCollision(_probe)) continue;
+
+    const g = treeTemplate.clone();
+    const s = 0.8 + hashId(i * 7 + 1) * 0.6;       // 0.8–1.4 size jitter
+    g.scale(s, s * (0.9 + hashId(i * 3 + 5) * 0.4), s);
+    g.translate(x, 0, z);
+    parts.push(g);
+  }
+
+  if (!parts.length) return 0;
+  const merged = parts.length === 1 ? parts[0] : mergeGeometries(parts, false);
+  const mesh = new THREE.Mesh(merged, new THREE.MeshStandardMaterial({
+    vertexColors: true, roughness: 0.9, metalness: 0,
+  }));
+  mesh.castShadow = true;
+  mesh.receiveShadow = true;
+  scene.add(mesh);
+  return parts.length;
 }
 
 // -----------------------------------------------------------------------------
@@ -1840,13 +1996,14 @@ async function boot() {
     dom.status.textContent = `Building 3D… (${buildings.length} buildings, ${roads.length} roads)`;
     const nB = buildBuildings(buildings);
     buildRoads(roads);
+    const nT = buildTrees();
     dom.crosshair.style.display = 'block';
     // Build the minimap now that colliders + roadSegments are populated.
     initMinimap();
     renderMinimapBase();
     dom.minimapWrap.hidden = false;
-    dom.status.textContent = `Jodhpur loaded: ${nB} buildings, ${roads.length} roads`;
-    console.log(`Loaded Jodhpur: ${nB} buildings, ${roads.length} roads.`);
+    dom.status.textContent = `Jodhpur loaded: ${nB} buildings, ${roads.length} roads, ${nT || 0} trees`;
+    console.log(`Loaded Jodhpur: ${nB} buildings, ${roads.length} roads, ${nT || 0} trees.`);
     animate();
     worldReady = true;
 

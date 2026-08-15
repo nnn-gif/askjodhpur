@@ -15,7 +15,7 @@
   <title>Walk Jodhpur — 3D city walk in the browser</title>
   <style>
     /* See README "Styling & overlay" for why these rules exist. */
-    html, body { margin: 0; height: 100%; background: #87ceeb; overflow: hidden; font-family: system-ui, sans-serif; }
+    html, body { margin: 0; height: 100%; background: #e8d5ae; overflow: hidden; font-family: system-ui, sans-serif; }
     #app { position: fixed; inset: 0; }
     canvas { display: block; touch-action: none; }  /* touch-action: mobile drag-look without browser pan/pinch fighting it */
 
@@ -61,7 +61,7 @@
       white-space: pre-line;   /* line 1: place + coords; line 2: nearest road/landmark */
     }
     #loading { position: fixed; inset: 0; display:flex; align-items:center; justify-content:center;
-      background:#87ceeb; color:#333; font-size: 1.1rem; z-index: 8; }
+      background:#e8d5ae; color:#333; font-size: 1.1rem; z-index: 8; }
     #loading.error { background:#fee; color:#900; }
     /* Visible load status so success/failure is observable without devtools. */
     #status { position: fixed; right: 12px; bottom: 12px; z-index: 5; color:#fff; font-size:12px;
@@ -227,6 +227,6 @@
   <!-- `?v=…` defeats caching of the module across releases. Bump this when
        app.js changes and you want every user (and embedded webview) to pick
        up the new code without a manual hard-reload. -->
-  <script type="module" src="./app.js?v=2026-08-12-24"></script>
+  <script type="module" src="./app.js?v=2026-08-12-25"></script>
 </body>
 </html>

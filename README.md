@@ -43,7 +43,7 @@ python3 -m http.server 8000
 
 Or with Node: `npx serve .` — any static server works.
 
-The city loads and you can walk immediately — **W A S D** to move, **drag** to look around, **`←` `→`** or **Q/E** to turn, **Shift** to run, **V** to switch between first- and third-person. (In a normal desktop browser, clicking once upgrades you to pointer-lock FPS mouse-look; in embedded webviews like this one, drag-to-look just stays active.)
+The city loads and you can walk immediately — **W A S D** to move, **drag** to look around, **`←` `→`** or **Q/E** to turn, **Shift** to run, **V** to cycle views: **first-person → third-person → top-down** (Road-Fighter-style — camera above you, heading-up, the world rotating beneath you; the best view for reading the street network). (In a normal desktop browser, clicking once upgrades you to pointer-lock FPS mouse-look; in embedded webviews like this one, drag-to-look just stays active.)
 
 ---
 
@@ -214,7 +214,9 @@ Identifying your location is unusually hard in Jodhpur's old city: only ~3% of i
 
 ## Character / third-person view (Vice-City style)
 
-Press **V** (or click the **👁 button** in the top-left) to switch between first- and third-person. In third-person you see a small blocky humanoid — your character — walking through Jodhpur, with the camera trailing behind and above, exactly like the original *Vice City*.
+Press **V** (or click the **👁 button** in the top-left) to cycle views: **first-person → third-person → top-down**. In third-person you see a small blocky humanoid — your character — walking through Jodhpur, with the camera trailing behind and above, exactly like the original *Vice City*. In **top-down** the camera hovers 60 m directly above you with your heading rotated to point up the screen — the classic *Road Fighter* / GTA 1–2 perspective, and the clearest view of the street network. (The avatar is visible in both third-person and top-down; only first-person hides it.)
+
+**Top-down camera details:** a straight-down `lookAt` is degenerate with the default up vector, so `camera.up` is set to the horizontal heading — forward always means "toward the top of the screen". Because of that, in top-down mode the camera's world direction says nothing about heading: the manual `yaw` variable becomes the authoritative heading there (the frame loop switches sources per mode), and the other camera branches restore the standard up vector. The movement right-vector uses a constant world-up rather than `camera.up` for the same reason.
 
 **Procedural avatar, no external assets.** The humanoid is built entirely from `BoxGeometry` primitives — torso, head/hair, two arms, two legs — in ~50 lines of `buildAvatar()`. Each limb is a child of a small *pivot group* positioned at the shoulder/hip joint, so rotating the pivot about X swings the limb naturally. This matches the demo's "no build step, no assets" philosophy: it can never 404 or hit a license snag. Colors lean Vice-City (orange "Hawaiian" shirt, dark pants).
 

@@ -70,6 +70,14 @@ const THIRD_PERSON_DIST   = 4.5;   // camera distance behind the avatar, meters
 const THIRD_PERSON_HEIGHT = 2.2;   // camera height above avatar feet, meters
 const AVATAR_LOOK_HEIGHT  = 1.2;   // where the camera aims on the avatar (chest)
 
+// --- Top-down (Road-Fighter-style) view tuning ----------------------------------
+// The camera hovers directly above the player, heading-up: your forward
+// direction always points to the top of the screen and the world rotates
+// beneath you — like the classic top-down driving games (and the original
+// GTA 1/2). This is also the best view for reading the street network.
+
+const TOP_DOWN_HEIGHT = 60;        // camera height above the ground, meters
+
 // --- Overpass reliability -------------------------------------------------------
 // The public Overpass service is free and shared. Heavy queries (a ~3 km city
 // box returns ~8 MB / thousands of buildings) intermittently fail with HTTP
@@ -1042,8 +1050,9 @@ function animateAvatar(dt, moving, speed) {
 // Jodhpur and traps the player. This spot has ~2 m of clearance.
 const playerPos = new THREE.Vector3(1, 0, -24);
 
-// `thirdPerson` selects the view mode. `active` (section 9) gates all input.
-let thirdPerson = false;
+// `viewMode` selects the camera mode: 'first' | 'third' | 'top' (the V key
+// cycles them). `active` (section 9) gates all input.
+let viewMode = 'first';
 
 // Head-bob phase for first-person walking (see updateCamera, section 12).
 let bobPhase = 0;
@@ -1055,7 +1064,10 @@ camera.position.set(playerPos.x, EYE_HEIGHT, playerPos.z);
 // Manual yaw/pitch used by the no-lock fallback look (section 9). In
 // pointer-lock mode PointerLockControls writes the camera quaternion directly
 // and these go stale — which is why the frame loop derives the player's yaw
-// from the camera's world direction instead of reading `yaw`.
+// from the camera's world direction instead of reading `yaw`. EXCEPTION: in
+// top-down mode the camera looks straight down, so its world direction says
+// nothing about heading — there the `yaw` variable IS the authority (the
+// camera is rotated to match it every frame).
 let yaw = 0;
 let pitch = 0;
 const PITCH_LIMIT = Math.PI / 2 - 0.05;
@@ -1068,23 +1080,34 @@ function applyFallbackLook() {
   camera.rotation.set(pitch, yaw, 0);
 }
 
-// Toggle between first- and third-person view. Called by the V key (section 9)
-// and the on-screen #viewToggle button (essential on touch devices and in
-// webviews that swallow synthetic key events). Builds the avatar lazily on
-// first toggle so first-person play pays nothing until the user opts in.
+// Cycle first-person → third-person → top-down (Road-Fighter-style) → back.
+// Called by the V key (section 9) and the on-screen #viewToggle button
+// (essential on touch devices and in webviews that swallow synthetic key
+// events). Builds the avatar lazily on first use so first-person play pays
+// nothing until the user opts in.
+const VIEW_LABELS = {
+  first: 'First-person — V: third-person',
+  third: 'Third-person — V: top-down',
+  top:   'Top-down (Road-Fighter style) — V: first-person',
+};
+const VIEW_BUTTONS = {
+  first: '👁 First person (V)',
+  third: '🚶 Third person (V)',
+  top:   '🚗 Top-down (V)',
+};
 function toggleView() {
   if (!active) return;
   if (!avatar) {
     avatar = buildAvatar();
     scene.add(avatar);
   }
-  thirdPerson = !thirdPerson;
-  avatar.visible = thirdPerson;
-  dom.status.textContent = thirdPerson
-    ? 'Third-person view — V to switch back'
-    : 'First-person view — V for third-person';
+  viewMode = viewMode === 'first' ? 'third' : viewMode === 'third' ? 'top' : 'first';
+  // The avatar is visible in third-person AND top-down (you see yourself
+  // from above); only first-person hides it.
+  avatar.visible = (viewMode !== 'first');
+  dom.status.textContent = VIEW_LABELS[viewMode];
   if (dom.viewToggle) {
-    dom.viewToggle.textContent = thirdPerson ? '🚶 Third person (V)' : '👁 First person (V)';
+    dom.viewToggle.textContent = VIEW_BUTTONS[viewMode];
   }
 }
 
@@ -1195,9 +1218,9 @@ function resumeGame() {
   active = true;
   dom.overlay.hidden = true;
   dom.hud.hidden = false;
-  dom.status.textContent = thirdPerson
-    ? 'Third-person view — V to switch'
-    : 'Resumed — drag to look, arrows to turn';
+  dom.status.textContent = viewMode === 'first'
+    ? 'Resumed — drag to look, arrows to turn'
+    : `Resumed — ${VIEW_LABELS[viewMode]}`;
 }
 
 // Reveal the interactive-mode UI pieces (shared by the pointer-lock and
@@ -1539,6 +1562,7 @@ const _move = new THREE.Vector3();
 const _right = new THREE.Vector3();
 const _tryPos = new THREE.Vector3();
 const _camProbe = new THREE.Vector3();
+const _worldUp = new THREE.Vector3(0, 1, 0);   // constant world up (camera.up is repurposed in top-down view)
 const _moveResult = { moving: false, speed: 0 };
 
 function animate() {
@@ -1551,20 +1575,28 @@ function animate() {
     updateInputDebug();
 
     // Shared per-frame derivations, computed AFTER turning so they reflect
-    // this frame's rotation. The camera's world direction is the one source
-    // of truth for orientation in BOTH control modes (in pointer-lock mode
-    // the manual `yaw` variable is stale — PointerLockControls writes the
-    // camera quaternion directly).
+    // this frame's rotation. In first/third-person the camera's world
+    // direction is the one source of truth (in pointer-lock mode the manual
+    // `yaw` variable is stale — PointerLockControls writes the camera
+    // quaternion directly). In TOP-DOWN the camera looks straight down, so
+    // its direction says nothing about heading — there the `yaw` variable is
+    // authoritative and the camera is rotated to match it in updateCamera.
     //
     //   playerYaw: radians, 0 = facing -Z (north). Forward in world XZ for
     //              this yaw is (sin yaw, 0, -cos yaw).
     //   camFwdFlat: the yaw's horizontal unit vector — used for movement and
-    //               the third-person camera offset.
-    camera.getWorldDirection(_camFwd);
-    const playerYaw = Math.atan2(_camFwd.x, -_camFwd.z);
-    _camFwdFlat.copy(_camFwd);
-    _camFwdFlat.y = 0;
-    _camFwdFlat.normalize();                   // keep movement horizontal
+    //               the camera offsets.
+    let playerYaw;
+    if (viewMode === 'top') {
+      playerYaw = yaw;
+      _camFwdFlat.set(Math.sin(yaw), 0, -Math.cos(yaw));
+    } else {
+      camera.getWorldDirection(_camFwd);
+      playerYaw = Math.atan2(_camFwd.x, -_camFwd.z);
+      _camFwdFlat.copy(_camFwd);
+      _camFwdFlat.y = 0;
+      _camFwdFlat.normalize();                 // keep movement horizontal
+    }
 
     const { moving, speed } = updateMovement(dt, _camFwdFlat);
     updateCamera(dt, _camFwdFlat, moving, speed, playerYaw);
@@ -1598,8 +1630,9 @@ function updateMovement(dt, camFwdFlat) {
                 - (keys['KeyS'] || keys['ArrowDown'] ? 1 : 0);
   const strafe  = (keys['KeyD'] ? 1 : 0) - (keys['KeyA'] ? 1 : 0);
 
-  // Right vector = forward × up (both horizontal).
-  _right.crossVectors(camFwdFlat, camera.up).normalize();
+  // Right vector = forward × WORLD up. (NOT camera.up — the top-down view
+  // rotates camera.up to the heading vector, which would zero this product.)
+  _right.crossVectors(camFwdFlat, _worldUp).normalize();
 
   _move.set(0, 0, 0);
   _move.addScaledVector(camFwdFlat, forward * speed * dt);
@@ -1634,7 +1667,7 @@ function updateMovement(dt, camFwdFlat) {
 //   head-bob — the walk cycle (animateAvatar) drives the limbs instead.
 function updateCamera(dt, camFwdFlat, moving, speed, playerYaw) {
   try {
-    if (thirdPerson) {
+    if (viewMode === 'third') {
       // Position the avatar at the player's feet, facing where the camera
       // looks (Vice-City style: character turns to face the view forward).
       // The avatar model's "front" is its local -Z, and world forward for
@@ -1643,6 +1676,11 @@ function updateCamera(dt, camFwdFlat, moving, speed, playerYaw) {
       avatar.position.set(playerPos.x, 0, playerPos.z);
       avatar.rotation.y = -playerYaw;
       animateAvatar(dt, moving, speed);
+
+      // Restore the standard up vector — the top-down view repurposes
+      // camera.up as the heading, and a leftover rotated up would skew this
+      // branch's lookAt after switching views.
+      camera.up.copy(_worldUp);
 
       // Camera: behind the player and above the feet — but PULLED IN FRONT OF
       // WALLS. In Jodhpur's tight lanes the naive fixed offset regularly put
@@ -1674,6 +1712,23 @@ function updateCamera(dt, camFwdFlat, moving, speed, playerYaw) {
       );
       // Look at the avatar's upper body.
       camera.lookAt(playerPos.x, AVATAR_LOOK_HEIGHT, playerPos.z);
+    } else if (viewMode === 'top') {
+      // TOP-DOWN (Road-Fighter style): camera directly above the player,
+      // looking down, with the heading rotated to point UP the screen — the
+      // world turns beneath you as you steer. The avatar is visible from
+      // above with its walk cycle; landmark beacons + labels read nicely
+      // from this height too.
+      avatar.position.set(playerPos.x, 0, playerPos.z);
+      avatar.rotation.y = -playerYaw;
+      animateAvatar(dt, moving, speed);
+
+      // lookAt with a straight-down view direction has a degenerate default
+      // up — we set camera.up to the horizontal heading so "forward" always
+      // means "toward the top of the screen". (updateCamera's other branches
+      // restore the standard up vector.)
+      camera.up.set(camFwdFlat.x, 0, camFwdFlat.z);
+      camera.position.set(playerPos.x, TOP_DOWN_HEIGHT, playerPos.z);
+      camera.lookAt(playerPos.x, 0, playerPos.z);
     } else {
       // First-person. Keep playerPos.y at eye height and apply head-bob.
       if (moving) {
@@ -1683,6 +1738,8 @@ function updateCamera(dt, camFwdFlat, moving, speed, playerYaw) {
         playerPos.y += (EYE_HEIGHT - playerPos.y) * Math.min(1, dt * 8);
       }
       camera.position.copy(playerPos);
+      // Restore the standard up vector in case the top-down view changed it.
+      camera.up.copy(_worldUp);
     }
   } catch (camErr) {
     console.warn('Camera/avatar placement error:', camErr);

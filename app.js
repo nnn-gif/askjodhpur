@@ -1161,6 +1161,13 @@ const controls = new PointerLockControls(camera, document.body);
 // raw key tracking, the V toggle, and resume-from-pause.
 const keys = Object.create(null);
 
+// Live drag-look state, shared with the frame loop for EDGE-CONTINUE
+// rotation (see updateDragEdgeRotation): without pointer lock, a drag only
+// rotates while the cursor moves — so turning more than ~90° ran out of
+// screen and stopped. Holding the drag near a viewport edge now keeps
+// rotating in that direction.
+const dragState = { dragging: false, x: 0, y: 0 };
+
 // `active` means "the demo is in interactive mode" — distinct from pointer
 // lock. WASD movement and turning are enabled whenever active is true, even
 // if pointer lock is unavailable. `worldReady` gates resume-from-pause so
@@ -1260,14 +1267,16 @@ function startFallback() {
   // essential on desktop: once pointer lock engages, PointerLockControls
   // rotates the camera from raw mouse movement — applying drag-look ON TOP of
   // it would double every rotation.
-  let dragging = false;
   let lastX = 0, lastY = 0;
   const onDown = (x, y) => {
     if (!active || controls.isLocked) return;
-    dragging = true; lastX = x; lastY = y;
+    dragState.dragging = true;
+    dragState.x = x; dragState.y = y;
+    lastX = x; lastY = y;
   };
   const onMove = (x, y) => {
-    if (!dragging || controls.isLocked) return;
+    dragState.x = x; dragState.y = y;   // kept for edge-continue rotation
+    if (!dragState.dragging || controls.isLocked) return;
     const dx = x - lastX, dy = y - lastY;
     lastX = x; lastY = y;
     yaw   -= dx * 0.005;            // mouse right → look right (yaw decreases)
@@ -1275,11 +1284,16 @@ function startFallback() {
     pitch  = Math.max(-PITCH_LIMIT, Math.min(PITCH_LIMIT, pitch));
     applyFallbackLook();
   };
-  const onUp = () => { dragging = false; };
+  const onUp = () => { dragState.dragging = false; };
 
   renderer.domElement.addEventListener('mousedown',  e => onDown(e.clientX, e.clientY));
   addEventListener('mousemove', e => onMove(e.clientX, e.clientY));
   addEventListener('mouseup',   onUp);
+  // If the pointer leaves the page (or the window loses focus) mid-drag, the
+  // mouseup never arrives — without this the edge-continue rotation would run
+  // away with a "stuck" drag.
+  document.addEventListener('mouseleave', onUp);
+  addEventListener('blur', onUp);
   // Touch support, so the demo also works on phones/tablets.
   renderer.domElement.addEventListener('touchstart', e => {
     if (e.touches[0]) onDown(e.touches[0].clientX, e.touches[0].clientY);
@@ -1572,6 +1586,7 @@ function animate() {
 
   if (active) {
     updateTurning(dt);
+    updateDragEdgeRotation(dt);
     updateInputDebug();
 
     // Shared per-frame derivations, computed AFTER turning so they reflect
@@ -1618,6 +1633,30 @@ function updateTurning(dt) {
     yaw += turn * 1.8 * dt;
     applyFallbackLook();
   }
+}
+
+// EDGE-CONTINUE rotation while dragging. Without pointer lock, drag-look only
+// rotates while the cursor MOVES — a single stroke covers ~90° before the
+// cursor reaches the edge of the viewport and rotation stops ("when I drag
+// there is limitation and it stops"). While a drag is held near a screen
+// edge, we keep rotating in that direction, scaled by how close to the edge
+// the pointer is (RTS-style edge scrolling). One stroke can now turn any
+// amount: drag to the edge and hold.
+const DRAG_EDGE_ZONE_PX  = 70;    // proximity to an edge that triggers rotation
+const DRAG_EDGE_RATE     = 2.2;   // rad/s at the very edge
+function updateDragEdgeRotation(dt) {
+  if (!dragState.dragging || controls.isLocked) return;
+  const w = window.innerWidth, h = window.innerHeight;
+  const dRight = w - dragState.x, dLeft = dragState.x;
+  const dBottom = h - dragState.y, dTop = dragState.y;
+
+  if (dRight < DRAG_EDGE_ZONE_PX)        yaw   -= (1 - dRight  / DRAG_EDGE_ZONE_PX) * DRAG_EDGE_RATE * dt;
+  else if (dLeft < DRAG_EDGE_ZONE_PX)    yaw   += (1 - dLeft   / DRAG_EDGE_ZONE_PX) * DRAG_EDGE_RATE * dt;
+  if (dBottom < DRAG_EDGE_ZONE_PX)       pitch -= (1 - dBottom / DRAG_EDGE_ZONE_PX) * DRAG_EDGE_RATE * dt;
+  else if (dTop < DRAG_EDGE_ZONE_PX)     pitch += (1 - dTop    / DRAG_EDGE_ZONE_PX) * DRAG_EDGE_RATE * dt;
+
+  pitch = Math.max(-PITCH_LIMIT, Math.min(PITCH_LIMIT, pitch));
+  applyFallbackLook();
 }
 
 // Desired horizontal velocity from input, applied to `playerPos` with

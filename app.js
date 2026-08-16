@@ -430,6 +430,9 @@ async function fetchLandmarks() {
     );
     out center tags;
   `;
+  // Two passes over the mirrors — the landmarks list drives the destinations
+  // panel AND missions, so a single bad Overpass moment shouldn't kill it.
+  for (let pass = 0; pass < 2; pass++) {
   for (const mirror of OVERPASS_MIRRORS) {
     try {
       const res = await fetch(mirror, {
@@ -475,7 +478,8 @@ async function fetchLandmarks() {
       console.warn(`Landmarks fetch failed on ${mirror}:`, e.message);
     }
   }
-  return [];   // non-fatal: panel just won't populate
+  }
+  return [];   // non-fatal: panel just won't populate (panorama spots work regardless)
 }
 
 // -----------------------------------------------------------------------------
@@ -1852,8 +1856,11 @@ function populateDestinations(list) {
 // footage) — photos/ is gitignored.
 const PANORAMA_SPOTS = [
   {
-    match: 'jaswant thada',                       // matched against landmark names
     label: 'Jaswant Thada (real 360° footage)',
+    // Own coordinates (OSM position of the memorial) so visits work even if
+    // the async landmarks fetch is slow or fails — the feature must not
+    // depend on a flaky API to be reachable.
+    lat: 26.30435, lon: 73.02531,
     files: [
       'photos/panoramas/jaswant-thada-1.jpg',
       'photos/panoramas/jaswant-thada-2.jpg',
@@ -1863,18 +1870,27 @@ const PANORAMA_SPOTS = [
     _next: 0,
   },
 ];
-const PANO_TRIGGER_M = 25;     // proximity to the landmark to offer the visit
+const PANO_TRIGGER_M = 25;     // proximity to the spot to offer the visit
 
 let panoramaMode = false;
 const _panoTexCache = new Map();
 let _hiddenForPano = [];
 let _savedSky = null, _savedFog = null;
 
+// Lazily convert each spot's lat/lon to scene coords (projection is defined
+// before this section, but computing on first use keeps the registry literal).
+function spotPos(spot) {
+  if (spot.x === undefined) {
+    const [x, z] = lonLatToXY(spot.lon, spot.lat);
+    spot.x = x; spot.z = z;
+  }
+  return spot;
+}
+
 function nearbyPanoramaSpot() {
   for (const s of PANORAMA_SPOTS) {
-    const lm = landmarks.find(l => l.name.toLowerCase().includes(s.match));
-    if (!lm) continue;
-    if (Math.hypot(lm.x - playerPos.x, lm.z - playerPos.z) < PANO_TRIGGER_M) return s;
+    spotPos(s);
+    if (Math.hypot(s.x - playerPos.x, s.z - playerPos.z) < PANO_TRIGGER_M) return s;
   }
   return null;
 }
@@ -1884,7 +1900,18 @@ function togglePanorama() {
   if (panoramaMode) { exitPanorama(); return; }
   const spot = nearbyPanoramaSpot();
   if (!spot) {
-    dom.status.textContent = 'No real-place view here yet — try Jaswant Thada (🚩 panel)';
+    // Guide the player to the nearest real place instead of a dead end —
+    // this also keeps the feature usable when the destinations panel hasn't
+    // loaded (landmarks fetch is async and can fail on a busy Overpass day).
+    let best = null, bestD = Infinity;
+    for (const s of PANORAMA_SPOTS) {
+      spotPos(s);
+      const d = Math.hypot(s.x - playerPos.x, s.z - playerPos.z);
+      if (d < bestD) { bestD = d; best = s; }
+    }
+    dom.status.textContent = best
+      ? `Nearest real place: ${best.label} · ${Math.round(bestD)} m ${arrowTo(best.x, best.z, yaw)} — walk there and press P`
+      : 'No real-place views available';
     return;
   }
   const file = spot.files[spot._next++ % spot.files.length];   // cycle views

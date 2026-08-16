@@ -98,13 +98,14 @@ out geom;
 - `out geom` embeds each way's coordinates inline. Without it we'd get node IDs and have to do a second request to resolve them.
 - The 60s timeout is set both in the query and handled on the client, because Overpass is a shared free service and large bboxes can be slow.
 
-**Reliability — what happens when Overpass 504s.** The public Overpass service is free and shared, and the Jodhpur box is heavy (~8 MB, ~9k buildings), so requests intermittently fail with **HTTP 429 / 503 / 504** under load. The loader defends against this in three layers (in `fetchOSM`):
+**Streaming — the world loads as a tile grid, not one mega-fetch.** The old design fetched one ~8 MB whole-city box before anything rendered. Now the world is a grid of **1 km tiles** (`tileBbox`/`loadTile`/`tilePump` in section 2): the single tile under the player loads first — the world is playable in one small query — then the 3×3 ring streams in the background one tile at a time (gentle on the free API), and as the player walks (or teleports) toward an edge, `updateStreaming()` queues the next ring **in the direction of travel**. Ways that straddle a tile boundary come back in both tile queries, so OSM ids are deduped globally. Each tile merges into its own mesh (one draw call per tile) and paints itself onto the minimap's fixed ±4 km base canvas on arrival. Failed tiles are simply skipped (neighbors still give a playable world) and retried when approached again.
+
+**Reliability — what happens when Overpass 504s.** The public Overpass service is free and shared, and requests intermittently fail with **HTTP 429 / 503 / 504** under load. Each tile fetch defends with two layers:
 
 1. **Multiple mirrors** — try `overpass-api.de` first, then `overpass.openstreetmap.fr`. (kumi.systems was dropped after being unreachable.)
 2. **Retry on transient errors** — each mirror gets a couple of attempts with a short backoff. Only transient codes (`429, 500, 502, 503, 504`) and network failures are retried; a real `400` bails immediately.
-3. **Shrink-and-retry** — if *every* mirror fails on the full bbox, the box is shrunk (100% → 60% → 35%) around the origin and tried again. Loading just the old-city core beats showing nothing.
 
-It also reads the response as text first and detects HTML error pages (Overpass returns those instead of JSON on some failures) so you get a sensible message instead of a cryptic JSON parse error. The on-screen status shows which mirror / attempt is in flight, so you can see it working.
+It also reads the response as text first and detects HTML error pages (Overpass returns those instead of JSON on some failures) so you get a sensible message instead of a cryptic JSON parse error. The on-screen status shows streaming totals as districts arrive.
 
 **Why not Google Maps / Mapbox tiles?** Those are raster/3D tiles you *look* at, not geometry you can collide with. We need raw polygons to build walkable 3D. Mapbox's vector tiles would work but require an API key and a paid plan above free tiers.
 

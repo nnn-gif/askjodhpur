@@ -15,9 +15,10 @@
   <title>Walk Jodhpur — 3D city walk in the browser</title>
   <style>
     /* See README "Styling & overlay" for why these rules exist. */
-    html, body { margin: 0; height: 100%; background: #e8d5ae; overflow: hidden; font-family: system-ui, sans-serif; }
+    html, body { margin: 0; height: 100%; background: #e8d5ae; overflow: hidden; font-family: system-ui, sans-serif;
+      user-select: none; -webkit-user-select: none; }   /* no native text-selection drags fighting drag-look */
     #app { position: fixed; inset: 0; }
-    canvas { display: block; touch-action: none; }  /* touch-action: mobile drag-look without browser pan/pinch fighting it */
+    canvas { display: block; touch-action: none; -webkit-user-drag: none; }  /* touch-action: mobile drag-look without browser pan/pinch fighting it */
 
     /* CRITICAL: an explicit `display` value (we use flex on #overlay/#loading)
        overrides the HTML `hidden` attribute, so toggling .hidden=true in JS
@@ -227,6 +228,6 @@
   <!-- `?v=…` defeats caching of the module across releases. Bump this when
        app.js changes and you want every user (and embedded webview) to pick
        up the new code without a manual hard-reload. -->
-  <script type="module" src="./app.js?v=2026-08-12-27"></script>
+  <script type="module" src="./app.js?v=2026-08-12-30"></script>
 </body>
 </html>

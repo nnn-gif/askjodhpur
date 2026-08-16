@@ -87,6 +87,16 @@ const FOV_SPRINT  = 82;    // FOV at full sprint
 const MOVE_ACCEL  = 10;    // velocity approach rate while input held (1/s)
 const MOVE_DECEL  = 7;     // ...and when releasing (slightly floatier stop)
 
+// --- World streaming (tile grid) --------------------------------------------------
+// Instead of one ~8 MB whole-city fetch, the world loads as a grid of 1 km
+// tiles around the PLAYER: the center tile starts in ~1–2 s (a ~1 MB query),
+// the 3×3 ring streams in the background, and walking/teleporting toward an
+// edge queues the next ring in your direction of travel. Tiles stay loaded
+// (memory stays modest — each tile is one merged mesh, one draw call).
+const TILE_SIZE_M = 1000;          // tile edge, meters
+const TILE_RING   = 1;             // load 3×3 tiles around the player
+const MINIMAP_EXTENT_M = 4000;     // minimap covers ±4 km from origin (fixed)
+
 // --- Overpass reliability -------------------------------------------------------
 // The public Overpass service is free and shared. Heavy queries (a ~3 km city
 // box returns ~8 MB / thousands of buildings) intermittently fail with HTTP
@@ -103,7 +113,6 @@ const OVERPASS_MIRRORS = [
   'https://overpass.openstreetmap.fr/api/interpreter',
 ];
 const TRANSIENT_STATUS = new Set([429, 500, 502, 503, 504]);
-const ATTEMPTS_PER_MIRROR = 4;
 const RETRY_DELAY_MS = 2500;
 
 // --- Minimap --------------------------------------------------------------------
@@ -264,42 +273,140 @@ function isRetryable(err) {
          m.includes('Load failed');
 }
 
-async function fetchOSM(onStatus) {
-  // Try the full city bbox across all mirrors, with retries on transient
-  // errors. If every mirror gives up on the full bbox, progressively shrink
-  // the box around the origin and try again — better to load the old-city
-  // core than to show nothing.
-  const bboxScales = [1, 0.6, 0.35];
-  for (const scale of bboxScales) {
-    const bbox = {
-      south: ORIGIN.lat - 0.015 * scale,
-      west:  ORIGIN.lon - 0.015 * scale,
-      north: ORIGIN.lat + 0.015 * scale,
-      east:  ORIGIN.lon + 0.015 * scale,
-    };
-    const query = buildOverpassQuery(bbox);
-    for (const mirror of OVERPASS_MIRRORS) {
-      for (let attempt = 1; attempt <= ATTEMPTS_PER_MIRROR; attempt++) {
-        const tag = scale < 1 ? ` (smaller area, ${Math.round(scale*100)}%)` : '';
-        onStatus && onStatus(
-          `Fetching Jodhpur from OpenStreetMap… (mirror ${OVERPASS_MIRRORS.indexOf(mirror)+1}/${OVERPASS_MIRRORS.length}, try ${attempt})${tag}`);
-        try {
-          const result = await fetchOnce(mirror, query);
-          // An empty result is not success — treat it like a failure so we
-          // shrink or move on. (Happens on rare bad-cache responses.)
-          if (!result.buildings.length && !result.roads.length) {
-            throw new Error('Overpass returned no data');
-          }
-          return result;
-        } catch (err) {
-          console.warn(`Overpass attempt failed (${mirror}, try ${attempt}, scale ${scale}):`, err.message);
-          if (!isRetryable(err)) throw err;          // permanent error → bail
-          if (attempt < ATTEMPTS_PER_MIRROR) await sleep(RETRY_DELAY_MS);
-        }
+// --- Streaming tile manager -------------------------------------------------------
+//
+// The whole city no longer loads in one mega-fetch. The world is a grid of
+// TILE_SIZE_M tiles; the tile under the player loads first (fast start), the
+// 3×3 ring streams in behind it, and moving toward an edge queues the next
+// ring in the direction of travel. Ways that straddle a tile boundary come
+// back in BOTH tile queries (Overpass returns full geometry for anything
+// intersecting the bbox), so ids are deduped globally. Each tile's buildings
+// merge into their own mesh (one draw call per tile) and paint onto the
+// minimap's fixed base canvas as they arrive.
+const loadedTiles = new Set();       // "ix,iz" keys of completed tiles
+const loadingTiles = new Set();      // in flight
+const _tileQueue = [];               // pending keys, loaded one at a time
+const seenBuildingIds = new Set();   // global OSM-way dedupe
+const seenRoadIds = new Set();
+let streamingStats = { buildings: 0, roads: 0, trees: 0, tiles: 0 };
+
+const tileKey = (ix, iz) => ix + ',' + iz;
+const playerTile = () => ({
+  ix: Math.round(playerPos.x / TILE_SIZE_M),
+  iz: Math.round(playerPos.z / TILE_SIZE_M),
+});
+
+// Scene-meters tile bounds → lat/lon bbox for Overpass.
+function tileBbox(ix, iz) {
+  const half = TILE_SIZE_M / 2;
+  const cx = ix * TILE_SIZE_M, cz = iz * TILE_SIZE_M;
+  return {
+    south: ORIGIN.lat + (cz - half) / METERS_PER_DEG_LAT,
+    north: ORIGIN.lat + (cz + half) / METERS_PER_DEG_LAT,
+    west:  ORIGIN.lon + (cx - half) / (METERS_PER_DEG_LAT * cosLat),
+    east:  ORIGIN.lon + (cx + half) / (METERS_PER_DEG_LAT * cosLat),
+  };
+}
+
+async function fetchTileData(bbox) {
+  // Mirrors × retries, no bbox-shrink (a 1 km tile that fails everywhere is
+  // just skipped — neighboring tiles still give a playable world).
+  for (const mirror of OVERPASS_MIRRORS) {
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        const r = await fetchOnce(mirror, buildOverpassQuery(bbox));
+        if (!r.buildings.length && !r.roads.length) throw new Error('Overpass returned no data');
+        return r;
+      } catch (err) {
+        console.warn(`Tile fetch failed (${mirror}, try ${attempt}):`, err.message);
+        if (attempt < 2) await sleep(RETRY_DELAY_MS);
       }
     }
   }
-  throw new Error('All Overpass mirrors failed. The free OSM API may be busy — please refresh in a moment.');
+  throw new Error('tile fetch failed on all mirrors');
+}
+
+async function loadTile(ix, iz) {
+  const key = tileKey(ix, iz);
+  if (loadedTiles.has(key) || loadingTiles.has(key)) return false;
+  loadingTiles.add(key);
+  try {
+    const data = await fetchTileData(tileBbox(ix, iz));
+
+    // Dedupe boundary-straddling ways, then build.
+    const buildings = data.buildings.filter(b => !seenBuildingIds.has(b.id));
+    const roads = data.roads.filter(r => !seenRoadIds.has(r.id));
+    for (const b of buildings) seenBuildingIds.add(b.id);
+    for (const r of roads) seenRoadIds.add(r.id);
+
+    const colsBefore = colliders.length;
+    const segsBefore = roadSegments.length;
+    const namedBefore = namedRoadSegments.length;
+
+    const nB = buildBuildings(buildings);
+    const nR = buildRoads(roads);
+    const newCols = colliders.slice(colsBefore);
+    const newSegs = roadSegments.slice(segsBefore);
+    const newNamed = namedRoadSegments.slice(namedBefore);
+    const nT = buildTrees(newSegs) || 0;
+
+    // Paint this tile onto the minimap's base canvas (fixed transform).
+    paintMinimapRegion(newCols, newSegs, newNamed);
+
+    loadedTiles.add(key);
+    streamingStats.buildings += nB;
+    streamingStats.roads += nR;
+    streamingStats.trees += nT;
+    streamingStats.tiles += 1;
+    console.log(`Tile ${key} loaded: +${nB} buildings, +${nR} roads, +${nT} trees (totals: ${streamingStats.buildings}/${streamingStats.roads}/${streamingStats.trees}).`);
+    // Keep the status line current while districts stream in — but never
+    // clobber game messages (mission/teleport/pause text).
+    if ((dom.status.textContent || '').includes('streaming')) {
+      dom.status.textContent =
+        `Jodhpur streaming: ${streamingStats.buildings} buildings, ${streamingStats.roads} roads, ${streamingStats.trees} trees — ${streamingStats.tiles} districts`;
+    }
+    return true;
+  } catch (err) {
+    console.warn(`Tile ${key} failed to load:`, err.message);
+    return false;   // not marked loaded — re-approaching the area retries
+  } finally {
+    loadingTiles.delete(key);
+  }
+}
+
+// Queue the 3×3 ring around a tile index (skips already-loaded tiles).
+function ensureTilesAround(ix, iz) {
+  for (let dz = -TILE_RING; dz <= TILE_RING; dz++) {
+    for (let dx = -TILE_RING; dx <= TILE_RING; dx++) {
+      const key = tileKey(ix + dx, iz + dz);
+      if (loadedTiles.has(key) || loadingTiles.has(key)) continue;
+      if (!_tileQueue.includes(key)) _tileQueue.push(key);
+    }
+  }
+}
+
+// Background pump: load queued tiles one at a time (gentle on the free
+// Overpass service). Runs forever; idles cheaply when the queue is empty.
+async function tilePump() {
+  for (;;) {
+    const key = _tileQueue.shift();
+    if (key === undefined) { await sleep(500); continue; }
+    // Skip if it became loaded/irrelevant while queued.
+    if (loadedTiles.has(key) || loadingTiles.has(key)) continue;
+    const [ix, iz] = key.split(',').map(Number);
+    await loadTile(ix, iz);
+  }
+}
+
+// Per-frame check (from animate): when the player crosses into a new tile,
+// ensure the ring around the new position. Cheap — a key comparison.
+let _lastPlayerTileKey = null;
+function updateStreaming() {
+  const { ix, iz } = playerTile();
+  const key = tileKey(ix, iz);
+  if (key === _lastPlayerTileKey) return;
+  _lastPlayerTileKey = key;
+  ensureTilesAround(ix, iz);
 }
 
 // Fetch named gates + major landmarks for the "destinations" panel — the list
@@ -630,6 +737,18 @@ function assignFacadeUVs(geo) {
   }
 }
 
+// The shared material for all city building meshes (one instance; every tile
+// merge references it — the facade texture and vertex colors do the variety).
+let _cityMaterial = null;
+function cityMaterial() {
+  if (!_cityMaterial) {
+    _cityMaterial = new THREE.MeshStandardMaterial({
+      vertexColors: true, map: facadeTexture(), roughness: 0.9, metalness: 0,
+    });
+  }
+  return _cityMaterial;
+}
+
 function buildBuildings(buildings) {
   // ALL buildings merge into ONE mesh whose per-building colors come from a
   // vertex-color attribute (see buildingColor). That's one draw call for the
@@ -712,13 +831,11 @@ function buildBuildings(buildings) {
     built++;
   }
 
-  // One merged mesh; the white base material lets vertex colors show through,
-  // and the facade map (windows) multiplies on top — tint × window pattern.
+  // One merged mesh PER TILE (called per tile by the streaming manager); the
+  // shared white base material lets vertex colors + the facade map through.
   if (allGeos.length) {
     const merged = allGeos.length === 1 ? allGeos[0] : mergeGeometries(allGeos, false);
-    const mesh = new THREE.Mesh(merged, new THREE.MeshStandardMaterial({
-      vertexColors: true, map: facadeTexture(), roughness: 0.9, metalness: 0,
-    }));
+    const mesh = new THREE.Mesh(merged, cityMaterial());
     mesh.castShadow = true;
     mesh.receiveShadow = true;
     scene.add(mesh);
@@ -797,12 +914,15 @@ function roadMaterial(color) {
 
 function buildRoads(roads) {
   // Group vertices by color so we can build one BufferGeometry per material
-  // (cheap to render; avoids one draw call per road).
+  // (cheap to render; avoids one draw call per road). Returns the number of
+  // road ways actually built (for the streaming status line).
   const byColor = Object.create(null);   // colorHex -> { verts: [], idx: [] }
+  let ways = 0;
 
   for (const r of roads) {
     const g = r.geometry;
     if (!g || g.length < 2) continue;
+    ways++;
     const tags = r.tags || {};
     const width = roadWidth(tags);
     const half = width / 2;
@@ -851,6 +971,7 @@ function buildRoads(roads) {
     geo.computeBoundingSphere();   // helps frustum culling
     scene.add(new THREE.Mesh(geo, roadMaterial(parseInt(color))));
   }
+  return ways;
 }
 
 // --- Trees: greenery along the roads -------------------------------------------
@@ -860,7 +981,9 @@ function buildRoads(roads) {
 // the roadside and rejected if they'd land inside a building footprint. All
 // trees merge into ONE vertex-colored mesh — one draw call, no per-frame
 // cost, purely decorative (no collision).
-function buildTrees() {
+// `segments` are the NEW road segments for one tile (streaming: called per
+// tile so trees are only planted along freshly loaded roads, never twice).
+function buildTrees(segments) {
   // Base tree geometry: trunk cylinder + low-poly canopy, vertex-colored.
   // toNonIndexed() on the trunk is REQUIRED before merging: CylinderGeometry
   // is indexed while IcosahedronGeometry is not, and mergeGeometries returns
@@ -883,9 +1006,9 @@ function buildTrees() {
 
   // Over-sample: the old city is dense, so the collision check rejects a
   // large share of roadside spots. Starting from ~1200 candidates lands
-  // roughly 300–400 actual trees.
+  // roughly 300–400 actual trees per full 3×3 ring of tiles.
   const TARGET = 1200;
-  const total = roadSegments.length;
+  const total = segments.length;
   if (!total) return 0;
   const chance = Math.min(1, TARGET / total);
 
@@ -893,7 +1016,7 @@ function buildTrees() {
   const _probe = new THREE.Vector3();
   for (let i = 0; i < total && parts.length < TARGET + 100; i++) {
     if (hashId(i * 131 + 17) > chance) continue;   // deterministic thinning
-    const seg = roadSegments[i];
+    const seg = segments[i];
     const dx = seg[2] - seg[0], dz = seg[3] - seg[1];
     const len = Math.hypot(dx, dz);
     if (len < 12) continue;                        // skip tiny segments
@@ -1013,83 +1136,53 @@ const MINIMAP = {
   ctx: null,         // its 2D context
   base: null,        // offscreen canvas with the static city map
   baseCtx: null,
-  transform: null,   // { minX, maxZ, PX_PER_M } world→pixel params, set by renderMinimapBase
+  transform: null,   // { minX, maxZ, PX_PER_M } — FIXED world→pixel mapping
 };
 
 function initMinimap() {
   MINIMAP.el = dom.minimap;
   MINIMAP.ctx = MINIMAP.el.getContext('2d');
-  // Offscreen canvas holds the full-city static layer. Sized so that the whole
-  // loaded bbox (~3 km) fits; we only blit the window around the player.
+  // FIXED-extent offscreen base: ±MINIMAP_EXTENT_M around the origin at
+  // 1 px/m (8000 px — at the browser canvas cap). With streaming tiles the
+  // world has no known total bounds up front, so the transform is fixed and
+  // each tile paints itself into this canvas as it loads (paintMinimapRegion).
+  const size = MINIMAP_EXTENT_M * 2;
   MINIMAP.base = document.createElement('canvas');
+  MINIMAP.base.width = MINIMAP.base.height = Math.min(8000, size);
   MINIMAP.baseCtx = MINIMAP.base.getContext('2d');
+  const PX_PER_M = MINIMAP.base.width / size;
+  MINIMAP.transform = { minX: -MINIMAP_EXTENT_M, maxZ: MINIMAP_EXTENT_M, PX_PER_M };
+  // Ground fill (matches the 3D ground color) — unpainted regions read as
+  // "not loaded yet" rather than void.
+  MINIMAP.baseCtx.fillStyle = '#c9b08a';
+  MINIMAP.baseCtx.fillRect(0, 0, MINIMAP.base.width, MINIMAP.base.height);
 }
 
-// Render the whole city once to the offscreen canvas. Called once after load.
-// We compute the data's bounding box, scale it to fit the offscreen canvas at
-// a chosen resolution, and draw every building polygon + road segment.
-function renderMinimapBase() {
-  // Guard: with no data at all (both Overpass result sets empty) the bounds
-  // would stay ±Infinity and the canvas size becomes NaN, throwing here —
-  // inside boot's try/catch that surfaced as a misleading "Failed to load
-  // Jodhpur" error. Skip the minimap instead; MINIMAP.transform stays null
-  // and updateMinimap no-ops.
-  if (!colliders.length && !roadSegments.length) return;
-
-  // World bounds covered by the data. Buildings are stored in colliders[]
-  // (with poly in scene XZ); roads in roadSegments[].
-  let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
-  for (const c of colliders) {
-    for (const [x, z] of c.poly) {
-      if (x < minX) minX = x; if (x > maxX) maxX = x;
-      if (z < minZ) minZ = z; if (z > maxZ) maxZ = z;
-    }
-  }
-  for (const seg of roadSegments) {
-    const x1 = seg[0], z1 = seg[1], x2 = seg[2], z2 = seg[3];
-    if (x1 < minX) minX = x1; if (x1 > maxX) maxX = x1;
-    if (x2 < minX) minX = x2; if (x2 > maxX) maxX = x2;
-    if (z1 < minZ) minZ = z1; if (z1 > maxZ) maxZ = z1;
-    if (z2 < minZ) minZ = z2; if (z2 > maxZ) maxZ = z2;
-  }
-  // Pad bounds slightly.
-  const pad = 20;
-  minX -= pad; maxX += pad; minZ -= pad; maxZ += pad;
-  const worldW = maxX - minX, worldH = maxZ - minZ;
-
-  // Offscreen resolution: aim for ~2 px per meter so buildings are legible when
-  // we zoom in. Cap the canvas dimensions to avoid blowing past browser limits
-  // for very large bboxes (3 km × 2 px/m = 6000 px, fine).
-  const PX_PER_M = 2;
-  const bw = Math.min(8000, Math.round(worldW * PX_PER_M));
-  const bh = Math.min(8000, Math.round(worldH * PX_PER_M));
-  MINIMAP.base.width = bw;
-  MINIMAP.base.height = bh;
+// Paint ONE TILE's worth of colliders/road-segments/named-segments onto the
+// fixed base canvas. Called by the streaming manager as tiles arrive; the
+// per-frame blit picks everything up automatically. (Replaces the old
+// whole-world renderMinimapBase, which needed all data up front.)
+function paintMinimapRegion(cols, segs, namedSegs) {
+  if (!MINIMAP.transform) return;
+  const { minX, maxZ, PX_PER_M } = MINIMAP.transform;
   const bctx = MINIMAP.baseCtx;
-
-  // Ground fill (matches the 3D ground color).
-  bctx.fillStyle = '#c9b08a';
-  bctx.fillRect(0, 0, bw, bh);
-
-  // Helper: world (x,z) → offscreen pixel (px,py). Note z maps to y, and we
-  // flip z so that north (+z) is UP on the map (canvas y grows downward).
+  // World (x,z) → offscreen pixel. z flips so north (+z) is UP.
   const wx = x => (x - minX) * PX_PER_M;
-  const wz = z => (maxZ - z) * PX_PER_M;   // flip: +z (north) → top of image
+  const wz = z => (maxZ - z) * PX_PER_M;
 
-  // Roads first (so buildings draw on top of them, like the 3D view).
+  // Roads (under buildings).
   bctx.strokeStyle = '#5a5147';
   bctx.lineWidth = Math.max(1, PX_PER_M * 1.2);
   bctx.beginPath();
-  for (const seg of roadSegments) {
+  for (const seg of segs) {
     bctx.moveTo(wx(seg[0]), wz(seg[1]));
     bctx.lineTo(wx(seg[2]), wz(seg[3]));
   }
   bctx.stroke();
 
-  // Buildings. Use a slightly darker blue than the 3D palette so they read
-  // against the sandy ground at small size.
+  // Buildings.
   bctx.fillStyle = '#2b4a7a';
-  for (const c of colliders) {
+  for (const c of cols) {
     const poly = c.poly;
     if (!poly || poly.length < 3) continue;
     bctx.beginPath();
@@ -1099,15 +1192,13 @@ function renderMinimapBase() {
     bctx.fill();
   }
 
-  // Label the NAMED roads along their direction — street names on the map are
-  // the strongest "I know this place" anchor. Only long-enough segments get a
-  // label to avoid clutter.
-  for (const s of namedRoadSegments) {
+  // Named-road labels along their direction — only long-enough segments.
+  for (const s of namedSegs) {
     const px1 = wx(s.x1), pz1 = wz(s.z1), px2 = wx(s.x2), pz2 = wz(s.z2);
-    if (Math.hypot(px2 - px1, pz2 - pz1) < 60) continue;   // too short to label
+    if (Math.hypot(px2 - px1, pz2 - pz1) < 60) continue;
     const mx = (px1 + px2) / 2, my = (pz1 + pz2) / 2;
     let ang = Math.atan2(pz2 - pz1, px2 - px1);
-    if (ang > Math.PI / 2 || ang < -Math.PI / 2) ang += Math.PI;  // keep readable
+    if (ang > Math.PI / 2 || ang < -Math.PI / 2) ang += Math.PI;  // readable
     bctx.save();
     bctx.translate(mx, my);
     bctx.rotate(ang);
@@ -1120,10 +1211,8 @@ function renderMinimapBase() {
     bctx.fillText(s.name, 0, -3);
     bctx.restore();
   }
-
-  // Stash the world→pixel transform params for the per-frame draw.
-  MINIMAP.transform = { minX, maxZ, PX_PER_M };
 }
+
 
 // Per-frame minimap draw: blit the static map centred on the player, then draw
 // the player marker. `heading` is the player yaw in radians, where 0 = facing
@@ -1379,6 +1468,8 @@ function teleportTo(x, z) {
       // Drop any in-flight movement so we don't smear the teleport.
       bobPhase = 0;
       _vel.set(0, 0, 0);   // momentum too — arrive standing, not skidding
+      // The destination may be outside loaded tiles — stream them now.
+      ensureTilesAround(Math.round(x / TILE_SIZE_M), Math.round(z / TILE_SIZE_M));
       // Refresh the place-name lookup immediately for the new location.
       const ll = scenePosToLatLon(playerPos);
       lastPlacePos = { x: playerPos.x, z: playerPos.z };
@@ -1511,52 +1602,45 @@ function startFallback() {
   showInteractiveUI();
   dom.status.textContent += '  •  drag to look, arrows to turn (pointer lock unavailable in this browser)';
 
-  // Drag with the mouse / touch to look around. Track button state so we only
-  // rotate while a button is held — otherwise the cursor stays usable. The
-  // `active` guard ignores drags while paused (pause-overlay background clicks
-  // now pass through to the canvas), and the `controls.isLocked` guard is
-  // essential on desktop: once pointer lock engages, PointerLockControls
-  // rotates the camera from raw mouse movement — applying drag-look ON TOP of
-  // it would double every rotation.
+  // Drag-to-look via the POINTER EVENTS API with pointer capture — the
+  // definitive fix for drags dying mid-gesture ("maneuver sticks after a
+  // certain point"). Earlier mouse-event versions failed in embedded webviews
+  // because the webview intercepts long drags for native gestures and simply
+  // STOPS delivering mousemove. setPointerCapture() re-targets all subsequent
+  // pointermove/pointerup events to this element for the life of the drag —
+  // the stream can't be interrupted — and pointer events unify mouse + touch,
+  // so the separate touch handlers are gone too.
   let lastX = 0, lastY = 0;
-  const onDown = (x, y) => {
+  const canvas = renderer.domElement;
+
+  canvas.addEventListener('pointerdown', e => {
     if (!active || controls.isLocked) return;
+    e.preventDefault();                     // no native selection/scroll drags
+    try { canvas.setPointerCapture(e.pointerId); } catch (err) { /* non-fatal */ }
     dragState.dragging = true;
-    dragState.x = x; dragState.y = y;
-    lastX = x; lastY = y;
-  };
-  const onMove = (x, y) => {
-    dragState.x = x; dragState.y = y;   // kept for edge-continue rotation
+    dragState.x = e.clientX; dragState.y = e.clientY;
+    lastX = e.clientX; lastY = e.clientY;
+  });
+  canvas.addEventListener('pointermove', e => {
+    dragState.x = e.clientX; dragState.y = e.clientY;   // for edge-continue
     if (!dragState.dragging || controls.isLocked) return;
-    const dx = x - lastX, dy = y - lastY;
-    lastX = x; lastY = y;
+    // Buttons no longer held → drag is over (covers release outside the view).
+    if (e.pointerType === 'mouse' && (e.buttons & 1) === 0) {
+      dragState.dragging = false;
+      return;
+    }
+    const dx = e.clientX - lastX, dy = e.clientY - lastY;
+    lastX = e.clientX; lastY = e.clientY;
     yaw   -= dx * 0.005;            // mouse right → look right (yaw decreases)
     pitch -= dy * 0.005;
     pitch  = Math.max(-PITCH_LIMIT, Math.min(PITCH_LIMIT, pitch));
     applyFallbackLook();
-  };
-  const onUp = () => { dragState.dragging = false; };
-
-  renderer.domElement.addEventListener('mousedown',  e => onDown(e.clientX, e.clientY));
-  // If the primary button is no longer held on a mousemove, the drag is over
-  // (the mouseup happened outside the window). This is the spurious-safe way
-  // to catch "stuck" drags: an earlier version also ended drags on window
-  // blur / document mouseleave, but those fire spuriously mid-gesture in
-  // embedded webviews and killed perfectly good drags ("when I drag it
-  // stops at some point").
-  addEventListener('mousemove', e => {
-    if (dragState.dragging && (e.buttons & 1) === 0) { onUp(); return; }
-    onMove(e.clientX, e.clientY);
   });
-  addEventListener('mouseup',   onUp);
-  // Touch support, so the demo also works on phones/tablets.
-  renderer.domElement.addEventListener('touchstart', e => {
-    if (e.touches[0]) onDown(e.touches[0].clientX, e.touches[0].clientY);
-  }, { passive: true });
-  renderer.domElement.addEventListener('touchmove', e => {
-    if (e.touches[0]) onMove(e.touches[0].clientX, e.touches[0].clientY);
-  }, { passive: true });
-  renderer.domElement.addEventListener('touchend', onUp);
+  const endDrag = () => { dragState.dragging = false; };
+  canvas.addEventListener('pointerup', endDrag);
+  canvas.addEventListener('pointercancel', endDrag);
+  // Belt-and-braces: never let the webview start a native drag of the canvas.
+  canvas.addEventListener('dragstart', e => e.preventDefault());
 }
 
 // --- Live WASD input indicator (#inputDebug) -----------------------------------
@@ -1895,6 +1979,7 @@ function animate() {
                                                 // when the tab was inactive)
 
   if (active) {
+    updateStreaming();         // crossed into a new tile → queue the next ring
     updateTurning(dt);
     updateDragEdgeRotation(dt);
     updateInputDebug();
@@ -2168,19 +2253,26 @@ function updateMinimap(playerYaw) {
 
 async function boot() {
   try {
-    dom.status.textContent = 'Fetching Jodhpur from OpenStreetMap…';
-    const { buildings, roads } = await fetchOSM(msg => { dom.status.textContent = msg; });
-    dom.status.textContent = `Building 3D… (${buildings.length} buildings, ${roads.length} roads)`;
-    const nB = buildBuildings(buildings);
-    buildRoads(roads);
-    const nT = buildTrees();
+    // --- STREAMING START -------------------------------------------------------
+    // Load ONLY the 1 km tile under the player first (a ~1 MB query vs the old
+    // ~8 MB whole-city fetch) so the world appears in a couple of seconds;
+    // the surrounding 3×3 ring streams in the background (tilePump), and as
+    // the player moves, updateStreaming() queues the next ring ahead of them.
+    initMinimap();                      // fixed-extent base; tiles paint in
+    dom.status.textContent = 'Loading your district of Jodhpur…';
+    const pt = playerTile();
+    const centerOk = await loadTile(pt.ix, pt.iz);
+    if (!centerOk && !colliders.length) {
+      throw new Error('Could not reach OpenStreetMap for the starting district.');
+    }
+
     dom.crosshair.style.display = 'block';
-    // Build the minimap now that colliders + roadSegments are populated.
-    initMinimap();
-    renderMinimapBase();
     dom.minimapWrap.hidden = false;
-    dom.status.textContent = `Jodhpur loaded: ${nB} buildings, ${roads.length} roads, ${nT || 0} trees`;
-    console.log(`Loaded Jodhpur: ${nB} buildings, ${roads.length} roads, ${nT || 0} trees.`);
+    dom.status.textContent =
+      `Jodhpur loaded (district): ${streamingStats.buildings} buildings — streaming the rest…`;
+    console.log(`Center tile ${tileKey(pt.ix, pt.iz)}: ${streamingStats.buildings} buildings, ${streamingStats.roads} roads.`);
+    ensureTilesAround(pt.ix, pt.iz);    // queue the 8 neighbors
+    tilePump();                         // background loader, runs forever
     animate();
     worldReady = true;
 

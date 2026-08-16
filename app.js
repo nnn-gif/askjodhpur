@@ -78,6 +78,15 @@ const AVATAR_LOOK_HEIGHT  = 1.2;   // where the camera aims on the avatar (chest
 
 const TOP_DOWN_HEIGHT = 60;        // camera height above the ground, meters
 
+// --- Movement feel (game juice) -------------------------------------------------
+// Momentum: velocity eases toward the input direction instead of snapping, so
+// starts/stops feel like a person with weight. FOV kick: the camera widens
+// slightly at sprint speed — cheap, but it makes running FEEL fast.
+const FOV_BASE    = 72;    // resting field of view (degrees)
+const FOV_SPRINT  = 82;    // FOV at full sprint
+const MOVE_ACCEL  = 10;    // velocity approach rate while input held (1/s)
+const MOVE_DECEL  = 7;     // ...and when releasing (slightly floatier stop)
+
 // --- Overpass reliability -------------------------------------------------------
 // The public Overpass service is free and shared. Heavy queries (a ~3 km city
 // box returns ~8 MB / thousands of buildings) intermittently fail with HTTP
@@ -393,8 +402,8 @@ scene.background = makeSkyTexture();
 scene.fog = new THREE.Fog(0xeed3a6, 120, 450);
 
 const camera = new THREE.PerspectiveCamera(
-  72,                                               // FOV — slightly wide, feels
-                                                    // like a person looking around
+  FOV_BASE,                                          // resting FOV; widens to
+                                                    // FOV_SPRINT while running
   window.innerWidth / window.innerHeight,
   0.1, 1000
 );
@@ -545,6 +554,82 @@ function buildingColor(id) {
   return new THREE.Color(hex).offsetHSL((jitter - 0.5) * 0.02, (jitter - 0.5) * 0.08, (jitter - 0.5) * 0.12);
 }
 
+// --- Facade texture: windows ----------------------------------------------------
+// A 2×2-cell texture (one cell ≈ 3×3 m of wall) drawn on a canvas: mostly
+// white (the building's vertex color tints it), dark window insets, and one
+// warm LIT window per texture — golden-hour lights just coming on. Applied to
+// the merged city mesh with side-wall UVs scaled so one texture cell = 3 m
+// (see assignFacadeUVs), this turns 8,900 blank boxes into a city with
+// windows at the cost of one texture.
+let _facadeTex = null;
+function facadeTexture() {
+  if (_facadeTex) return _facadeTex;
+  const CELL = 96;                       // px per 3 m
+  const c = document.createElement('canvas');
+  c.width = c.height = CELL * 2;
+  const g = c.getContext('2d');
+  g.fillStyle = '#ffffff';               // white — vertex color provides tint
+  g.fillRect(0, 0, c.width, c.height);
+  // Subtle wall grain so tinted walls aren't perfectly flat.
+  for (let i = 0; i < 340; i++) {
+    g.fillStyle = Math.random() < 0.5 ? 'rgba(0,0,0,0.035)' : 'rgba(255,255,255,0.05)';
+    g.fillRect(Math.random() * c.width, Math.random() * c.height, 2, 2);
+  }
+  const drawWindow = (x, y, lit) => {
+    // Window: dark inset with frame, sized/positioned like a real one.
+    const wx = x + CELL * 0.22, wy = y + CELL * 0.18, ww = CELL * 0.56, wh = CELL * 0.52;
+    g.fillStyle = 'rgba(0,0,0,0.22)';    // outer shadow line
+    g.fillRect(wx - 2, wy - 2, ww + 4, wh + 4);
+    if (lit) {
+      // Warm lit window — lights on at dusk. Slight gradient glow.
+      const grad = g.createLinearGradient(wx, wy, wx, wy + wh);
+      grad.addColorStop(0, '#ffd98f');
+      grad.addColorStop(1, '#ffb95e');
+      g.fillStyle = grad;
+    } else {
+      // Dark glass with a hint of sky reflection.
+      const grad = g.createLinearGradient(wx, wy, wx, wy + wh);
+      grad.addColorStop(0, 'rgba(28,38,52,0.88)');
+      grad.addColorStop(1, 'rgba(16,22,32,0.92)');
+      g.fillStyle = grad;
+    }
+    g.fillRect(wx, wy, ww, wh);
+    // Sill.
+    g.fillStyle = 'rgba(0,0,0,0.18)';
+    g.fillRect(wx - 3, wy + wh + 2, ww + 6, 3);
+  };
+  // 2×2 windows; deterministically light one of the four.
+  const litIdx = 2;
+  for (let i = 0; i < 4; i++) {
+    drawWindow((i % 2) * CELL, Math.floor(i / 2) * CELL, i === litIdx);
+  }
+  const tex = new THREE.CanvasTexture(c);
+  tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+  tex.anisotropy = 4;
+  _facadeTex = tex;
+  return tex;
+}
+
+// Rewrite SIDE-WALL UVs so the facade texture tiles one cell per 3 m:
+// u = position along the wall (world X or Z, whichever the wall faces),
+// v = height. ExtrudeGeometry's default side UVs don't follow wall length,
+// which would smear the window pattern; this makes windows real-size.
+// Cap faces (roof/footprint) keep their default UVs — the texture's white
+// base means the roof just takes the building tint.
+function assignFacadeUVs(geo) {
+  const pos = geo.attributes.position;
+  const nor = geo.attributes.normal;
+  const uv = geo.attributes.uv;
+  for (let i = 0; i < pos.count; i++) {
+    const ny = nor.getY(i);
+    if (Math.abs(ny) > 0.5) continue;             // top/bottom caps
+    const nx = nor.getX(i), nz = nor.getZ(i);
+    const x = pos.getX(i), y = pos.getY(i), z = pos.getZ(i);
+    const u = Math.abs(nx) > Math.abs(nz) ? z / 3 : x / 3;
+    uv.setXY(i, u, y / 3);
+  }
+}
+
 function buildBuildings(buildings) {
   // ALL buildings merge into ONE mesh whose per-building colors come from a
   // vertex-color attribute (see buildingColor). That's one draw call for the
@@ -586,13 +671,21 @@ function buildBuildings(buildings) {
     // So rotate -90° about X: maps local +Z → world +Y, and local XY → world XZ.
     geo.rotateX(-Math.PI / 2);
     geo.computeVertexNormals();
+    assignFacadeUVs(geo);
 
-    // Bake this building's color into a vertex-color attribute.
+    // Bake this building's color into a vertex-color attribute, with FAKE
+    // AMBIENT OCCLUSION: vertices darken toward the ground (0.72× at the base
+    // → 1.0× at the roofline). Real AO needs lightmaps; this 2-line version
+    // grounds the buildings convincingly and costs nothing at render time.
     const col = buildingColor(b.id);
     const vcount = geo.attributes.position.count;
     const colors = new Float32Array(vcount * 3);
+    const posAttr = geo.attributes.position;
+    const aoFloor = 0.72;
     for (let i = 0; i < vcount; i++) {
-      colors[i * 3] = col.r; colors[i * 3 + 1] = col.g; colors[i * 3 + 2] = col.b;
+      const t = Math.max(0, Math.min(1, posAttr.getY(i) / height)); // 0 base → 1 roof
+      const ao = aoFloor + (1 - aoFloor) * t;
+      colors[i * 3] = col.r * ao; colors[i * 3 + 1] = col.g * ao; colors[i * 3 + 2] = col.b * ao;
     }
     geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
     allGeos.push(geo);
@@ -619,11 +712,12 @@ function buildBuildings(buildings) {
     built++;
   }
 
-  // One merged mesh; the white base material lets vertex colors show through.
+  // One merged mesh; the white base material lets vertex colors show through,
+  // and the facade map (windows) multiplies on top — tint × window pattern.
   if (allGeos.length) {
     const merged = allGeos.length === 1 ? allGeos[0] : mergeGeometries(allGeos, false);
     const mesh = new THREE.Mesh(merged, new THREE.MeshStandardMaterial({
-      vertexColors: true, roughness: 0.85, metalness: 0,
+      vertexColors: true, map: facadeTexture(), roughness: 0.9, metalness: 0,
     }));
     mesh.castShadow = true;
     mesh.receiveShadow = true;
@@ -1284,6 +1378,7 @@ function teleportTo(x, z) {
       playerPos.set(test.x, EYE_HEIGHT, test.z);
       // Drop any in-flight movement so we don't smear the teleport.
       bobPhase = 0;
+      _vel.set(0, 0, 0);   // momentum too — arrive standing, not skidding
       // Refresh the place-name lookup immediately for the new location.
       const ll = scenePosToLatLon(playerPos);
       lastPlacePos = { x: playerPos.x, z: playerPos.z };
@@ -1651,6 +1746,59 @@ function populateDestinations(list) {
   dom.destHeader.addEventListener('click', () => dom.destinations.classList.toggle('collapsed'));
 }
 
+// --- Missions: endless deliveries -------------------------------------------------
+// A reason to walk: a persistent delivery loop between real landmarks. Each
+// mission targets a landmark (≥300 m away when possible), pays by distance,
+// and chains forever. Money persists across reloads via localStorage — the
+// beginning of game progression on top of the map.
+let money = parseInt(localStorage.getItem('wj_money') || '0', 10) || 0;
+let mission = null;               // { name, x, z, reward }
+const MISSION_ARRIVE_M = 15;      // arrival radius
+
+function newMission() {
+  if (!landmarks.length) { mission = null; return; }
+  // Prefer a target that's an actual journey away; fall back to the farthest
+  // of a few random picks in a small old city.
+  let best = null, bestD = -1;
+  for (let tries = 0; tries < 8; tries++) {
+    const c = landmarks[Math.floor(Math.random() * landmarks.length)];
+    const d = Math.hypot(c.x - playerPos.x, c.z - playerPos.z);
+    if (d > 300) { best = c; break; }
+    if (d > bestD) { best = c; bestD = d; }
+  }
+  const d = Math.hypot(best.x - playerPos.x, best.z - playerPos.z);
+  mission = {
+    name: best.name, x: best.x, z: best.z,
+    reward: Math.max(10, Math.round(d / 100) * 10),
+  };
+}
+
+// 8-way direction arrow from the player to a point, relative to `heading`
+// (the shared playerYaw: 0 = facing north/-Z; same convention as movement).
+function arrowTo(tx, tz, heading) {
+  const bearing = Math.atan2(tx - playerPos.x, -(tz - playerPos.z));
+  let rel = bearing - heading;
+  while (rel > Math.PI) rel -= 2 * Math.PI;
+  while (rel < -Math.PI) rel += 2 * Math.PI;
+  const arrows = ['↑', '↗', '→', '↘', '↓', '↙', '←', '↖'];
+  return arrows[((Math.round(rel / (Math.PI / 4)) % 8) + 8) % 8];
+}
+
+// Mission tick: returns the HUD line (target + arrow + distance + reward +
+// money), completes the mission on arrival, and chains the next one.
+function updateMission(heading) {
+  if (!mission) return money > 0 ? `💰 ₹${money}` : '';
+  const d = Math.hypot(mission.x - playerPos.x, mission.z - playerPos.z);
+  if (d < MISSION_ARRIVE_M) {
+    money += mission.reward;
+    localStorage.setItem('wj_money', String(money));
+    dom.status.textContent = `✅ Delivered to ${mission.name}! +₹${mission.reward} — next delivery…`;
+    newMission();
+    return '';
+  }
+  return `🎯 ${mission.name} ${arrowTo(mission.x, mission.z, heading)} ${Math.round(d)} m · ₹${mission.reward}   |   💰 ₹${money}`;
+}
+
 // -----------------------------------------------------------------------------
 // 11. Place-name lookup (Nominatim reverse geocode)
 // -----------------------------------------------------------------------------
@@ -1737,6 +1885,8 @@ const _right = new THREE.Vector3();
 const _tryPos = new THREE.Vector3();
 const _camProbe = new THREE.Vector3();
 const _worldUp = new THREE.Vector3(0, 1, 0);   // constant world up (camera.up is repurposed in top-down view)
+const _vel = new THREE.Vector3();              // persistent horizontal velocity (momentum)
+const _desiredVel = new THREE.Vector3();       // input-derived target velocity
 const _moveResult = { moving: false, speed: 0 };
 
 function animate() {
@@ -1774,9 +1924,20 @@ function animate() {
     }
 
     const { moving, speed } = updateMovement(dt, _camFwdFlat);
+
+    // FOV kick: widen toward FOV_SPRINT as actual speed passes walking pace —
+    // pure game-feel; makes sprinting read as fast. Eased and only touched
+    // when it changes (updateProjectionMatrix is not free).
+    const sprintT = Math.max(0, Math.min(1, (speed - WALK_SPEED) / (RUN_SPEED - WALK_SPEED)));
+    const targetFov = FOV_BASE + sprintT * (FOV_SPRINT - FOV_BASE);
+    if (Math.abs(camera.fov - targetFov) > 0.05) {
+      camera.fov += (targetFov - camera.fov) * Math.min(1, dt * 5);
+      camera.updateProjectionMatrix();
+    }
+
     updateCamera(dt, _camFwdFlat, moving, speed, playerYaw);
     updateNearest();       // nearest named road + landmark (throttled 1 s)
-    updateHud();
+    updateHud(playerYaw);
     updateMinimap(playerYaw);
   }
 
@@ -1819,9 +1980,12 @@ function updateDragEdgeRotation(dt) {
   applyFallbackLook();
 }
 
-// Desired horizontal velocity from input, applied to `playerPos` with
-// axis-separated collision resolution. Returns whether the player is moving
-// and at what speed (the camera/avatar code needs both).
+// Desired horizontal velocity from input — with MOMENTUM. The velocity eases
+// toward the input direction (accelerate a touch faster than decelerate) so
+// starts and stops have weight; at a steady walk this is indistinguishable
+// from the old direct control, but sprinting away or skidding to a stop now
+// feels like a body, not a turret. Returns the ACTUAL speed (post-momentum),
+// which the camera FOV kick and walk cycle use.
 function updateMovement(dt, camFwdFlat) {
   const speed = keys['ShiftLeft'] || keys['ShiftRight'] ? RUN_SPEED : WALK_SPEED;
 
@@ -1833,9 +1997,15 @@ function updateMovement(dt, camFwdFlat) {
   // rotates camera.up to the heading vector, which would zero this product.)
   _right.crossVectors(camFwdFlat, _worldUp).normalize();
 
-  _move.set(0, 0, 0);
-  _move.addScaledVector(camFwdFlat, forward * speed * dt);
-  _move.addScaledVector(_right,     strafe  * speed * dt);
+  _desiredVel.set(0, 0, 0);
+  _desiredVel.addScaledVector(camFwdFlat, forward * speed);
+  _desiredVel.addScaledVector(_right,      strafe  * speed);
+
+  // Exponential approach: frame-rate independent easing.
+  const k = _desiredVel.lengthSq() > 0 ? MOVE_ACCEL : MOVE_DECEL;
+  _vel.lerp(_desiredVel, 1 - Math.exp(-k * dt));
+
+  _move.copy(_vel).multiplyScalar(dt);
 
   // Sub-step the move so one large frame delta can't TUNNEL through a thin
   // wall. The frame dt is clamped to 0.05 s and sprint speed is 14 m/s, so a
@@ -1854,8 +2024,9 @@ function updateMovement(dt, camFwdFlat) {
     if (!resolveCollision(_tryPos)) playerPos.z = _tryPos.z;
   }
 
-  _moveResult.moving = (forward !== 0 || strafe !== 0);
-  _moveResult.speed = speed;
+  const actualSpeed = _vel.length();
+  _moveResult.moving = actualSpeed > 0.4;   // small threshold: skid counts as moving
+  _moveResult.speed = actualSpeed;
   return _moveResult;
 }
 
@@ -1945,8 +2116,8 @@ function updateCamera(dt, camFwdFlat, moving, speed, playerYaw) {
   }
 }
 
-// HUD: place name (throttled Nominatim lookup) + live coordinates.
-function updateHud() {
+// HUD: place name (throttled Nominatim lookup) + live coordinates + mission.
+function updateHud(heading) {
   try {
     const now = performance.now();
     const moved = lastPlacePos
@@ -1961,15 +2132,17 @@ function updateHud() {
     }
 
     const ll = scenePosToLatLon(playerPos);
-    // Two lines: Nominatim place + coordinates, then nearest named road and
-    // nearest landmark with distances (the useful "where am I" anchors in a
-    // city where most streets are unnamed in OSM). #hud uses pre-line.
+    // Three lines: (1) Nominatim place + coordinates, (2) nearest named road
+    // and landmark with distances, (3) the active delivery mission. #hud uses
+    // pre-line.
     const line2 = [_nearestRoadTxt, _nearestLmTxt].filter(Boolean).join('   ·   ');
+    const line3 = updateMission(heading);
     dom.hud.textContent =
       (currentPlace ? currentPlace + '   |   ' : '') +
       `XY: ${playerPos.x.toFixed(0)}, ${playerPos.z.toFixed(0)} m   |   ` +
       `lat/lon: ${ll.lat.toFixed(5)}, ${ll.lon.toFixed(5)}` +
-      (line2 ? '\n' + line2 : '');
+      (line2 ? '\n' + line2 : '') +
+      (line3 ? '\n' + line3 : '');
   } catch (hudErr) {
     // Never let the HUD kill the frame loop — fall back to bare coordinates.
     console.warn('HUD update error:', hudErr);
@@ -2027,6 +2200,7 @@ async function boot() {
       if (landmarks.length) {
         buildLandmarkBeacons();
         drawLandmarksOnMinimap();
+        newMission();     // start the delivery loop
         console.log(`Loaded ${landmarks.length} destinations.`);
       }
     }).catch(err => console.warn('Landmarks fetch failed:', err.message));

@@ -233,6 +233,15 @@ A subtle but important correctness fix came with this: the manual `yaw`/`pitch` 
 
 ---
 
+## Real-place panorama visits (isolated places)
+
+Where real 360° footage of a landmark exists, the game can swap the 3D city for the **actual place**: stand within ~25 m of a covered landmark (or teleport there via the 🚩 panel), press **P**, and the panorama becomes the environment — the whole 3D world hides, the normal drag/arrow look controls turn you inside the real photo, and **P** brings you back. Multiple views per landmark cycle on each visit. The HUD shows a `🎬 P — real 360° view` hint whenever a visit is available.
+
+- **Source:** 360° videos (e.g. Jaswant Thada), downloaded with `yt-dlp`, distinct views extracted with ffmpeg scene detection — repeat the pipeline for any new video with `tools/extract-panoramas.sh <video-or-url> <slug>`, then register the frames in `PANORAMA_SPOTS` in app.js. Frames are equirect-mapped by default; a spot whose source turns out not to be equirect flips to `mode: 'flat'` with one string.
+- **Media stays out of git** (`photos/` is gitignored — the source footage is copyrighted; get permission before shipping any of it publicly).
+
+---
+
 ## Sense of place — golden-hour Jodhpur
 
 Geometry alone doesn't make a place feel like a place; light, color variation, and ground truth do. This pass (all procedural, zero new assets) transformed the scene from "flat blue boxes under noon light" into late-afternoon Rajasthan:

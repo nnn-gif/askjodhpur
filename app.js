@@ -1519,8 +1519,11 @@ let worldReady = false;
 
 addEventListener('keydown', e => {
   keys[e.code] = true;
-  // V switches first/third-person view.
+  // V cycles first/third/top-down view.
   if (e.code === 'KeyV') toggleView();
+  // P visits the real-place panorama when near a landmark that has footage
+  // (or returns to the 3D city if already visiting).
+  if (e.code === 'KeyP') togglePanorama();
   // If paused (Esc), any movement/look key resumes — but only once the world
   // has finished loading.
   if (!active && worldReady && RESUME_KEYS.includes(e.code)) resumeGame();
@@ -1698,6 +1701,7 @@ function distPointToSegment(px, pz, x1, z1, x2, z2) {
 // segment distance tests — trivial, but no reason to do them 60×/s).
 let _nearestRoadTxt = '';
 let _nearestLmTxt = '';
+let _panoHintTxt = '';
 let _lastNearestTime = 0;
 function updateNearest() {
   const now = performance.now();
@@ -1719,6 +1723,10 @@ function updateNearest() {
     if (d < bestLmD) { bestLmD = d; bestLm = l; }
   }
   _nearestLmTxt = bestLm ? `📍 ${bestLm.name} · ${Math.round(bestLmD)} m` : '';
+  // Real-place visit available? (panorama spot near the player)
+  _panoHintTxt = (worldReady && !panoramaMode && nearbyPanoramaSpot())
+    ? '🎬 P — real 360° view'
+    : '';
 }
 
 // A canvas-texture sprite with the given text — used for floating landmark
@@ -1828,6 +1836,106 @@ function populateDestinations(list) {
 
   // Collapsible header.
   dom.destHeader.addEventListener('click', () => dom.destinations.classList.toggle('collapsed'));
+}
+
+// --- Panorama visits: isolated real places ---------------------------------------
+//
+// Where we have real 360° footage of a landmark (extracted from user-provided
+// video into photos/panoramas/), standing near that landmark and pressing P
+// swaps the 3D city for the REAL place: the panorama becomes the environment,
+// the world is hidden, and the normal drag/arrow look controls turn you
+// inside the photo. P returns to the city. Multiple views per landmark cycle
+// on each visit.
+//
+// The frames come from the tools/extract-panoramas.sh pipeline (yt-dlp +
+// ffmpeg scene-detection). They are kept OUT of git (copyrighted source
+// footage) — photos/ is gitignored.
+const PANORAMA_SPOTS = [
+  {
+    match: 'jaswant thada',                       // matched against landmark names
+    label: 'Jaswant Thada (real 360° footage)',
+    files: [
+      'photos/panoramas/jaswant-thada-1.jpg',
+      'photos/panoramas/jaswant-thada-2.jpg',
+      'photos/panoramas/jaswant-thada-3.jpg',
+    ],
+    mode: 'equirect',                             // or 'flat' if a source isn't equirect
+    _next: 0,
+  },
+];
+const PANO_TRIGGER_M = 25;     // proximity to the landmark to offer the visit
+
+let panoramaMode = false;
+const _panoTexCache = new Map();
+let _hiddenForPano = [];
+let _savedSky = null, _savedFog = null;
+
+function nearbyPanoramaSpot() {
+  for (const s of PANORAMA_SPOTS) {
+    const lm = landmarks.find(l => l.name.toLowerCase().includes(s.match));
+    if (!lm) continue;
+    if (Math.hypot(lm.x - playerPos.x, lm.z - playerPos.z) < PANO_TRIGGER_M) return s;
+  }
+  return null;
+}
+
+function togglePanorama() {
+  if (!worldReady) return;
+  if (panoramaMode) { exitPanorama(); return; }
+  const spot = nearbyPanoramaSpot();
+  if (!spot) {
+    dom.status.textContent = 'No real-place view here yet — try Jaswant Thada (🚩 panel)';
+    return;
+  }
+  const file = spot.files[spot._next++ % spot.files.length];   // cycle views
+  dom.status.textContent = `Loading ${spot.label}…`;
+  const show = tex => applyPanorama(spot, tex);
+  let tex = _panoTexCache.get(file);
+  if (tex) { show(tex); return; }
+  new THREE.TextureLoader().load(
+    file,
+    t => {
+      if (spot.mode !== 'flat') {
+        t.mapping = THREE.EquirectangularReflectionMapping;
+        t.colorSpace = THREE.SRGBColorSpace;
+      }
+      _panoTexCache.set(file, t);
+      show(t);
+    },
+    undefined,
+    () => { dom.status.textContent = `Could not load ${file}`; },
+  );
+}
+
+function applyPanorama(spot, tex) {
+  panoramaMode = true;
+  _savedSky = scene.background;
+  _savedFog = scene.fog;
+  if (spot.mode !== 'flat') {
+    scene.background = tex;             // full-sphere environment
+  } else {
+    // Fallback mode for non-equirect sources: giant backdrop plane ahead.
+    // (Not currently used; kept so a source can flip modes with one string.)
+    scene.background = _savedSky;
+  }
+  scene.fog = null;
+  // Hide the whole 3D world — this is an ISOLATED visit to the real place.
+  _hiddenForPano = [];
+  for (const child of scene.children) {
+    if (child.visible) { _hiddenForPano.push(child); child.visible = false; }
+  }
+  camera.position.set(playerPos.x, EYE_HEIGHT, playerPos.z);
+  _vel.set(0, 0, 0);
+  dom.status.textContent = `🎬 ${spot.label} — drag or ←→ to look around · P to return`;
+}
+
+function exitPanorama() {
+  panoramaMode = false;
+  scene.background = _savedSky;
+  scene.fog = _savedFog;
+  for (const c of _hiddenForPano) c.visible = true;
+  _hiddenForPano = [];
+  dom.status.textContent = 'Back in the 3D city';
 }
 
 // --- Missions: endless deliveries -------------------------------------------------
@@ -1979,6 +2087,18 @@ function animate() {
                                                 // when the tab was inactive)
 
   if (active) {
+    // PANORAMA VISIT: the 3D world is hidden and the real 360° photo is the
+    // environment. Only look-controls run (drag/arrows rotate you inside the
+    // photo); movement, streaming, camera placement, and physics are frozen.
+    if (panoramaMode) {
+      updateTurning(dt);
+      updateDragEdgeRotation(dt);
+      applyFallbackLook();           // yaw/pitch drive the view in all modes
+      updateHud(yaw);
+      renderer.render(scene, camera);
+      return;
+    }
+
     updateStreaming();         // crossed into a new tile → queue the next ring
     updateTurning(dt);
     updateDragEdgeRotation(dt);
@@ -2220,7 +2340,7 @@ function updateHud(heading) {
     // Three lines: (1) Nominatim place + coordinates, (2) nearest named road
     // and landmark with distances, (3) the active delivery mission. #hud uses
     // pre-line.
-    const line2 = [_nearestRoadTxt, _nearestLmTxt].filter(Boolean).join('   ·   ');
+    const line2 = [_nearestRoadTxt, _nearestLmTxt, _panoHintTxt].filter(Boolean).join('   ·   ');
     const line3 = updateMission(heading);
     dom.hud.textContent =
       (currentPlace ? currentPlace + '   |   ' : '') +
